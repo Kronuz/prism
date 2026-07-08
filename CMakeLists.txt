@@ -30,5 +30,10 @@ FetchContent_MakeAvailable(traceback)
 FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG main)
 FetchContent_MakeAvailable(logger)
 
+# The request/response logging middleware (recovers Xapiand's dropped to_text
+# logging): an http::HttpHandler decorator on http + logger + term-color.
+FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG main)
+FetchContent_MakeAvailable(http_log)
+
 add_executable(prism src/main.cc)
-target_link_libraries(prism PRIVATE http::http traceback::traceback logger::logger Threads::Threads)
+target_link_libraries(prism PRIVATE http::http traceback::traceback logger::logger http_log::http_log Threads::Threads)

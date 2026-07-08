@@ -43,6 +43,7 @@
 #include "colors.h"         // term-color: rgb()/brgb()/CLEAR_COLOR (stacked escapes)
 #include "color_tools.hh"   // term-color: the runtime color class
 #include "logger.h"         // Kronuz/logger: Logging, LogConfig, the L_* macros
+#include "http_log.h"       // Kronuz/http-log: the request/response logging middleware
 
 // ---------------------------------------------------------------------------
 // col — colors as term-color stacked escapes (16/256/truecolor). Kronuz/logger's
@@ -166,108 +167,8 @@ static std::string pretty_json(std::string_view in) {
 	return out;
 }
 
-// A body preview for the log: JSON is prettified, other text is shown
-// (truncated), binary is summarized.
-static std::string preview_body(std::string_view ct, std::string_view body, std::size_t limit = 512) {
-	if (body.empty()) return col::grey() + "(empty)" + col::reset();
-	bool binary = ct.substr(0, 6) == "image/" || ct.find("octet-stream") != std::string_view::npos;
-	if (binary) return col::grey() + "(" + std::to_string(body.size()) + " bytes, " + std::string(ct) + ")" + col::reset();
-	std::string text;
-	auto first = body.find_first_not_of(" \t\r\n");
-	bool looks_json = ct.find("json") != std::string_view::npos ||
-		(first != std::string_view::npos && (body[first] == '{' || body[first] == '['));
-	if (looks_json) {
-		std::string pretty = pretty_json(body);
-		// Re-indent multi-line JSON so continuation lines align under the log's
-		// 4-space body gutter.
-		std::string indented;
-		for (char c : pretty) { indented += c; if (c == '\n') indented += "    "; }
-		text = std::move(indented);
-	} else {
-		text = std::string(body);
-	}
-	std::string s = text.substr(0, limit);
-	if (text.size() > limit) s += col::grey() + " ...(+" + std::to_string(text.size() - limit) + " bytes)" + col::reset();
-	return s;
-}
-
-// ---------------------------------------------------------------------------
-// AccessLog — an HttpHandler decorator that logs each request and response, maps
-// an unhandled exception to a 500 with a traceback, and previews image responses
-// inline on iTerm2. (Phase 2: extract as Kronuz/access-log.)
-// ---------------------------------------------------------------------------
-class CapturingWriter : public http::ResponseWriter {
-	http::ResponseWriter& real_;
-	static bool iequal(std::string_view a, std::string_view b) {
-		if (a.size() != b.size()) return false;
-		for (std::size_t i = 0; i < a.size(); ++i)
-			if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
-		return true;
-	}
-public:
-	int code = 200;
-	std::string content_type = "text/plain";
-	std::string body;
-	bool started = false;
-	explicit CapturingWriter(http::ResponseWriter& r) : real_(r) {}
-	void status(int c) override { code = c; started = true; real_.status(c); }
-	void set_header(std::string_view n, std::string_view v) override {
-		if (iequal(n, "Content-Type")) content_type = std::string(v);
-		real_.set_header(n, v);
-	}
-	void write(std::string_view c) override { started = true; body.append(c); real_.write(c); }
-	void end() override { real_.end(); }
-	void set_close() override { real_.set_close(); }
-};
-
-class AccessLog : public http::HttpHandler {
-	http::HttpHandler& inner_;
-public:
-	explicit AccessLog(http::HttpHandler& inner) : inner_(inner) {}
-
-	void handle(const http::Request& req, http::ResponseWriter& resp) override {
-		auto t0 = std::chrono::steady_clock::now();
-		L_NOTICE(col::bfg(120, 144, 156) + "-> " + col::reset() +
-			col::fg(3, 169, 244) + req.method + col::reset() + " " + req.path);
-		if (Logging::config.log_level >= LOG_INFO) {
-			for (auto& [k, v] : req.headers)
-				L_INFO("    " + col::grey() + k + ":" + col::reset() + " " + v);
-			if (!req.body.empty())
-				L_INFO("    " + preview_body(req.content_type(), req.body));
-		}
-
-		CapturingWriter cap(resp);
-		try {
-			inner_.handle(req, cap);
-		} catch (...) {
-			// L_EXC logs the in-flight exception; its description and (when enabled)
-			// the backtrace come from the logger's hooks, which main() points at
-			// Kronuz/traceback. Then finish the response and log the 500.
-			L_EXC(std::string("unhandled exception in ") + req.method + " " + req.path);
-			if (!cap.started) resp.send(500, "Internal Server Error\n");
-			L_ERR(col::bfg(244, 67, 54) + "<- 500" + col::reset() + " (exception)");
-			return;
-		}
-
-		double ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count() / 1000.0;
-		int c = cap.code;
-		std::string sc = c < 300 ? col::bfg(76, 175, 80)
-			: c < 400 ? col::bfg(3, 169, 244)
-			: c < 500 ? col::bfg(255, 152, 0)
-			: col::bfg(244, 67, 54);
-		char timing[32];
-		std::snprintf(timing, sizeof timing, "%.2fms", ms);
-		L_NOTICE(sc + "<- " + std::to_string(c) + col::reset() + " " +
-			col::grey() + timing + col::reset() + "  " + cap.content_type);
-		if (Logging::config.log_level >= LOG_INFO) {
-			if (Logging::iterm2_available() && cap.content_type.substr(0, 6) == "image/" && !cap.body.empty()) {
-				L_INFO("    \033]1337;File=inline=1;height=6:" + b64encode(cap.body) + "\a");
-			} else {
-				L_INFO("    " + preview_body(cap.content_type, cap.body));
-			}
-		}
-	}
-};
+// The request/response logging middleware is Kronuz/http-log (http_log::AccessLog);
+// prism injects the JSON reindenter above as its body prettifier. See main().
 
 // ---------------------------------------------------------------------------
 // The application: a plain Router of views. Everything above is the framework.
@@ -368,7 +269,22 @@ int main(int argc, char** argv) {
 	Logging::add_handler(std::make_unique<StderrLogger>());
 
 	DemoApp app;
-	AccessLog access(app);
+	// The request/response logging middleware, with prism's JSON reindenter as the
+	// body prettifier (Xapiand injects a MsgPack/YAML one instead). prism lowers the
+	// levels from the Xapiand-faithful defaults (DEBUG) so the rich blocks show at
+	// -v, and previews images at -vv.
+	http_log::Options logopts;
+	logopts.request_level = LOG_INFO;
+	logopts.level_2xx = LOG_INFO;
+	logopts.image_level = LOG_INFO;
+	logopts.prettify = [](std::string_view ct, std::string_view body) -> std::optional<std::string> {
+		auto first = body.find_first_not_of(" \t\r\n");
+		bool json = ct.find("json") != std::string_view::npos ||
+			(first != std::string_view::npos && (body[first] == '{' || body[first] == '['));
+		if (json) return pretty_json(body);
+		return std::nullopt;
+	};
+	http_log::AccessLog access(app, std::move(logopts));
 
 	http::HttpAsioService service(access, reactors, /*workers=*/2, /*queue_limit=*/256);
 	service.enable_compression();
