@@ -70,31 +70,56 @@ static const char* kPrismPngB64 =
 	"iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAABAElEQVR42s3O4WACAAAF4aN5AiNIIIIEIhhBAhEkEEECESQwggje3jLYvxO4+2jSr/SQHtNTek6/00t6TW/pPX2kz/SV/qTvtHk3P82reTaP5t7cmmtzab6bc3Nqjs2h+fqr/2+ASrMBKs0GqDQboNJsgEqzASrNBqg0G6DSbIBKswEqzQaoNBug0myASrMBKs0GqDQboNJsgEqzOirN6qg0q6PSrI5KszoqzeqoNKuj0qyOSrM6Ks3qqDSro9KsjkqzOirN6qg0q6PSvD8gkaYfkEizASrNBqg0G6DSbIBKswEqzQaoNBug0myASrMBKs0GqDQboNJsgEqzASrNBr8MX5RP/5PNSQAAAABJRU5ErkJggg==";
 
 // ---------------------------------------------------------------------------
-// Splash — an RGB spectrum banner, printed undecorated through the logger sink
-// (so it is color-resolved by the same --color / NO_COLOR policy as the log).
+// banner — a glass prism dispersing the wordmark into a spectrum, printed
+// through the logger sink at NOTICE (gated by the log level and routed through
+// the sink, the way Xapiand's banner() prints — not the immediate L_PRINT).
+// The extracted logger's L() has no base-color argument (Xapiand's does); the
+// colors live in the message and it ends on a reset. Mirrors Xapiand's layout:
+// an icon on the left, an ASCII wordmark on the right in figlet's Standard font
+// (the same font as Xapiand's "apiand"). The prism is colorless glass; "prism"
+// leaves the far side split into a spectrum, one rainbow stop per row.
 // (Phase 2: extract as Kronuz/splash, data driven by name/version/subtitle.)
 // ---------------------------------------------------------------------------
-static void splash(unsigned port, std::size_t reactors) {
-	const char* name = "prism";
-	static const int stops[][3] = {
+static void banner(unsigned port, std::size_t reactors) {
+	if (Logging::config.log_level < LOG_NOTICE) {
+		return;
+	}
+	// The glass prism icon (left) and the "prism" wordmark (right, figlet
+	// Standard font). Backslashes are C++-escaped; rows are printed verbatim.
+	static const char* prism[6] = {
+		"        ",
+		"   /\\   ",
+		"  /  \\  ",
+		" /    \\ ",
+		"/______\\",
+		"        ",
+	};
+	static const char* word[6] = {
+		"            _",
+		" _ __  _ __(_)___ _ __ ___",
+		"| '_ \\| '__| / __| '_ ` _ \\",
+		"| |_) | |  | \\__ \\ | | | | |",
+		"| .__/|_|  |_|___/_| |_| |_|",
+		"|_|",
+	};
+	// Colorless glass (top-lit), and the spectrum it disperses top-to-bottom.
+	static const int glass[6][3] = {
+		{0, 0, 0}, {240, 240, 240}, {215, 215, 215}, {190, 190, 190}, {165, 165, 165}, {0, 0, 0},
+	};
+	static const int spectrum[6][3] = {
 		{233, 30, 99}, {255, 152, 0}, {255, 235, 59}, {76, 175, 80}, {33, 150, 243}, {103, 58, 183},
 	};
-	// The wordmark in a rainbow sweep (bold rides inside each color).
-	std::string wordmark;
-	for (std::size_t i = 0; name[i]; ++i) {
-		const auto& c = stops[i % 6];
-		wordmark += col::bfg(c[0], c[1], c[2]) + std::string(1, name[i]);
+	std::string b = "\n\n";
+	for (int i = 0; i < 6; ++i) {
+		const auto& g = glass[i];
+		const auto& s = spectrum[i];
+		b += col::bfg(g[0], g[1], g[2]) + prism[i] + col::reset() + "  " +
+			col::bfg(s[0], s[1], s[2]) + word[i] + col::reset() + "\n";
 	}
-	wordmark += col::reset();
-	// A little prism triangle splitting a white beam into the spectrum.
-	std::string b = "\n";
-	b += "  " + col::bfg(230, 230, 230) + "/\\" + col::reset() + "\n";
-	b += "  " + col::bfg(210, 210, 210) + "/  \\" + col::reset() + "   " + wordmark + "\n";
-	b += " " + col::fg(190, 190, 190) + "/____\\" + col::reset() + "  " +
-		col::grey() + "a flashy HTTP application server" + col::reset() + "\n\n";
+	b += "          " + col::grey() + "a flashy HTTP application server" + col::reset() + "\n\n";
 	b += "  " + col::fg(76, 175, 80) + "listening" + col::reset() + " http://127.0.0.1:" +
-		std::to_string(port) + "/   " + col::grey() + "(" + std::to_string(reactors) + " reactors)" + col::reset();
-	L_PRINT(b);
+		std::to_string(port) + "/   " + col::grey() + "(" + std::to_string(reactors) + " reactors)" + col::reset() + "\n";
+	L(-LOG_NOTICE, "{}", b);
 }
 
 // A structural JSON pretty-printer for the log. It re-indents rather than
@@ -265,7 +290,7 @@ int main(int argc, char** argv) {
 	std::signal(SIGTERM, on_signal);
 
 	service.start(static_cast<unsigned short>(port));
-	splash(port, reactors);
+	banner(port, reactors);
 	L_NOTICE(col::grey() + "ready -- Ctrl-C to stop" + col::reset());
 
 	while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
