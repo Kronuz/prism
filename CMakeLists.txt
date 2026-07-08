@@ -23,5 +23,12 @@ FetchContent_MakeAvailable(http_lib)
 FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG main)
 FetchContent_MakeAvailable(traceback)
 
+# The deferred, lock-free logger (leveled, colored, timestamped). It transitively
+# brings term-color (the stacked-escape palette + the collapse/apply resolution
+# the logger sink applies per --color/NO_COLOR/terminal) and scheduler, so prism's
+# whole logging + color stack is the same one Xapiand runs on.
+FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG main)
+FetchContent_MakeAvailable(logger)
+
 add_executable(prism src/main.cc)
-target_link_libraries(prism PRIVATE http::http traceback::traceback Threads::Threads)
+target_link_libraries(prism PRIVATE http::http traceback::traceback logger::logger Threads::Threads)

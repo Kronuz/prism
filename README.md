@@ -24,10 +24,15 @@ of the box is small on purpose, so the wiring stays legible.
 - **Colored, leveled logging of every exchange.** The request line and headers, the
   response status, wall time, content type, and a body preview, each at its own
   verbosity. JSON request and response bodies are prettified in the log; on iTerm2,
-  an image response is previewed inline.
+  an image response is previewed inline. This runs on
+  [logger](https://github.com/Kronuz/logger) and
+  [term-color](https://github.com/Kronuz/term-color) (the same logging and color
+  stack Xapiand uses), so `--color`, `NO_COLOR`, and the tty check are handled for
+  you.
 - **A traceback when a handler throws.** An unhandled exception becomes a `500` and,
   when enabled, a demangled, symbolized stack trace in the log, instead of a silent
-  drop.
+  drop. The trace is [traceback](https://github.com/Kronuz/traceback), wired into
+  the logger's backtrace hook exactly as Xapiand wires it.
 
 ## Why it exists
 
@@ -40,10 +45,13 @@ router, negotiation, compression, conditional/range handling) over
 [reactor](https://github.com/Kronuz/reactor) (the Asio runtime),
 [http-parser](https://github.com/Kronuz/http-parser),
 [radix-router](https://github.com/Kronuz/radix-router),
-[compressors](https://github.com/Kronuz/compressors), and
-[traceback](https://github.com/Kronuz/traceback). The point of assembling them here
-is that the seams are visible: you can read one file and see how a request becomes a
-logged, negotiated, compressed response.
+[compressors](https://github.com/Kronuz/compressors),
+[logger](https://github.com/Kronuz/logger) +
+[term-color](https://github.com/Kronuz/term-color) (leveled, colored logging), and
+[traceback](https://github.com/Kronuz/traceback). It uses them the way Xapiand does,
+not a parallel re-implementation. The point of assembling them here is that the seams
+are visible: you can read one file and see how a request becomes a logged, negotiated,
+compressed response.
 
 ## Build and run
 
@@ -63,6 +71,8 @@ Usage: prism [PORT] [-v|-vv|-q] [--no-tracebacks]
   -v                debug logging (request/response headers + body preview)
   -vv               trace logging
   -q                quiet (warnings and errors only)
+  --color=<mode>    auto (default) | always | never | truecolor | 256 | 16 | stacked
+  --no-color        alias for --color=never
   --no-tracebacks   don't print a stack trace on an unhandled error
 ```
 
