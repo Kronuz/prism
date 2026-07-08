@@ -197,9 +197,15 @@ int main(int argc, char** argv) {
 	std::string color = "auto";
 	for (int i = 1; i < argc; ++i) {
 		std::string a = argv[i];
-		if (a == "-v") log_level = LOG_INFO;             // + headers + body previews
-		else if (a == "-vv") log_level = LOG_DEBUG;      // + any debug-compiled lines
-		else if (a == "-q") log_level = LOG_WARNING;     // warnings + errors only
+		if (a == "-q") log_level = LOG_WARNING;          // warnings + errors only
+		else if (a.size() >= 2 && a[0] == '-' &&
+		         a.find_first_not_of('v', 1) == std::string::npos) {
+			// -v, -vv, -vvv, -vvvv, ...: count the v's, each raising verbosity one
+			// level above the NOTICE default (requests already show at the default;
+			// -v adds image previews, -vv debug-compiled lines, and so on). Accepting
+			// any run of v's is why `prism -vvvv` is no longer silently ignored.
+			log_level = LOG_NOTICE + static_cast<int>(a.size()) - 1;
+		}
 		else if (a == "--no-tracebacks") tracebacks = false;
 		else if (a == "--no-color") color = "never";
 		else if (a.rfind("--color=", 0) == 0) color = a.substr(8);
@@ -235,12 +241,12 @@ int main(int argc, char** argv) {
 	DemoApp app;
 	// The request/response logging middleware, with prism's JSON reindenter as the
 	// body prettifier (Xapiand injects a MsgPack/YAML one instead). prism lowers the
-	// levels from the Xapiand-faithful defaults (DEBUG) so the rich blocks show at
-	// -v, and previews images at -vv.
+	// levels from the Xapiand-faithful defaults (DEBUG) to NOTICE so the rich blocks
+	// show out of the box (a bare `prism`), with image previews at -v and above.
 	http_log::Options logopts;
-	logopts.request_level = LOG_INFO;
-	logopts.level_2xx = LOG_INFO;
-	logopts.image_level = LOG_INFO;
+	logopts.request_level = LOG_NOTICE;
+	logopts.level_2xx = LOG_NOTICE;
+	logopts.image_level = LOG_NOTICE;
 	logopts.prettify = [](std::string_view ct, std::string_view body) -> std::optional<std::string> {
 		auto first = body.find_first_not_of(" \t\r\n");
 		bool json = ct.find("json") != std::string_view::npos ||
