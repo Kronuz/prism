@@ -44,6 +44,7 @@
 #include "color_tools.hh"   // term-color: the runtime color class
 #include "logger.h"         // Kronuz/logger: Logging, LogConfig, the L_* macros
 #include "http_log.h"       // Kronuz/http-log: the request/response logging middleware
+#include "cppcodec/base64_rfc4648.hpp"   // base64 (reached via http-log's include path)
 
 // ---------------------------------------------------------------------------
 // col — colors as term-color stacked escapes (16/256/truecolor). Kronuz/logger's
@@ -60,46 +61,9 @@ inline std::string grey() { return fg(105, 105, 105); }
 }  // namespace col
 
 // ---------------------------------------------------------------------------
-// base64 (used for the iTerm2 image escape).
+// The embedded PNG is base64-decoded with cppcodec (the codec the rest of the
+// Kronuz libs use), reached through http-log's include path. See /image below.
 // ---------------------------------------------------------------------------
-static std::string b64encode(std::string_view in) {
-	static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	std::string out;
-	out.reserve((in.size() + 2) / 3 * 4);
-	std::size_t i = 0;
-	for (; i + 2 < in.size(); i += 3) {
-		unsigned n = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8 | (unsigned char)in[i + 2];
-		out += T[n >> 18 & 63]; out += T[n >> 12 & 63]; out += T[n >> 6 & 63]; out += T[n & 63];
-	}
-	if (i < in.size()) {
-		unsigned n = (unsigned char)in[i] << 16;
-		if (i + 1 < in.size()) n |= (unsigned char)in[i + 1] << 8;
-		out += T[n >> 18 & 63]; out += T[n >> 12 & 63];
-		out += (i + 1 < in.size()) ? T[n >> 6 & 63] : '=';
-		out += '=';
-	}
-	return out;
-}
-static std::string b64decode(std::string_view in) {
-	auto val = [](char c) -> int {
-		if (c >= 'A' && c <= 'Z') return c - 'A';
-		if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-		if (c >= '0' && c <= '9') return c - '0' + 52;
-		if (c == '+') return 62;
-		if (c == '/') return 63;
-		return -1;
-	};
-	std::string out;
-	int buf = 0, bits = 0;
-	for (char c : in) {
-		int v = val(c);
-		if (v < 0) continue;
-		buf = buf << 6 | v;
-		bits += 6;
-		if (bits >= 8) { bits -= 8; out += char((buf >> bits) & 0xFF); }
-	}
-	return out;
-}
 
 // A 48x48 spectrum PNG, embedded so /image needs no asset at runtime.
 static const char* kPrismPngB64 =
@@ -212,7 +176,7 @@ public:
 		router_.route("POST", "/json", json_echo);
 		router_.route("GET", "/json", json_echo);
 		router_.route("GET", "/image", [](const http::Request&, http::ResponseWriter& resp, const http::Params&) {
-			static const std::string png = b64decode(kPrismPngB64);
+			static const std::string png = cppcodec::base64_rfc4648::decode<std::string>(std::string_view(kPrismPngB64));
 			resp.send(200, png, "image/png");
 		});
 		router_.route("GET", "/boom", [](const http::Request&, http::ResponseWriter&, const http::Params&) {
