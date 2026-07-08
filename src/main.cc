@@ -102,7 +102,7 @@ static void banner(unsigned port, std::size_t reactors) {
 		"| '_ \\| '__| / __| '_ ` _ \\",
 		"| |_) | |  | \\__ \\ | | | | |",
 		"| .__/|_|  |_|___/_| |_| | |",
-		"| |                       \\|",
+		"| |                       \\|",  // "m" descender frame; the tagline is injected into the gap (loop below)
 		"|/",
 	};
 	// Colorless glass (top-lit), and the spectrum it disperses top-to-bottom
@@ -117,11 +117,20 @@ static void banner(unsigned port, std::size_t reactors) {
 	for (int i = 0; i < 7; ++i) {
 		const auto& g = glass[i];
 		const auto& s = spectrum[i < 6 ? i : 5];
-		b += col::bfg(g[0], g[1], g[2]) + prism[i] + col::reset() + " " +
-			col::bfg(s[0], s[1], s[2]) + word[i] + col::reset() + "\n";
+		b += col::bfg(g[0], g[1], g[2]) + prism[i] + col::reset() + " ";
+		if (i == 5) {
+			// The tagline nestles inside the "m" descender, framed by its two
+			// strokes; " the flashy app server " is exactly the 23-col gap, so
+			// the closing "\|" stays aligned under the stem above it.
+			b += col::bfg(s[0], s[1], s[2]) + "| |" + col::reset() +
+				col::grey() + " the flashy app server " + col::reset() +
+				col::bfg(s[0], s[1], s[2]) + "\\|" + col::reset();
+		} else {
+			b += col::bfg(s[0], s[1], s[2]) + word[i] + col::reset();
+		}
+		b += "\n";
 	}
-	b += "           " + col::grey() + "a flashy HTTP application server" + col::reset() + "\n\n";
-	b += "  " + col::fg(76, 175, 80) + "listening" + col::reset() + " http://127.0.0.1:" +
+	b += "\n  " + col::fg(76, 175, 80) + "listening" + col::reset() + " http://127.0.0.1:" +
 		std::to_string(port) + "/   " + col::grey() + "(" + std::to_string(reactors) + " reactors)" + col::reset() + "\n";
 	L(-LOG_NOTICE, "{}", b);
 }

@@ -22,9 +22,10 @@ of the box is small on purpose, so the wiring stays legible.
   Conditional (`ETag`/`If-*`) and range requests are on too.
 - **A banner on boot.** A glass-prism icon and the "prism" wordmark in figlet's
   Standard font (the same font as Xapiand's "apiand"), the word split into a
-  spectrum, plus the subtitle and the address it's listening on. It prints through
-  the logger sink at NOTICE, gated by the log level, the way Xapiand's `banner()`
-  does.
+  spectrum, with the "p" and "m" hand-stylized into descenders and the tagline
+  ("the flashy app server") nestled inside the "m" descender, plus the address
+  it's listening on. It prints through the logger sink at NOTICE, gated by the log
+  level, the way Xapiand's `banner()` does.
 - **Colored, leveled logging of every exchange.** The request line and headers, the
   response status, wall time, content type, and a body preview, each at its own
   verbosity. JSON request and response bodies are prettified in the log; on iTerm2,
