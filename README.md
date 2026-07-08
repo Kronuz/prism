@@ -23,7 +23,8 @@ of the box is small on purpose, so the wiring stays legible.
 - **A splash on boot.** Name, subtitle, and the address it's listening on.
 - **Colored, leveled logging of every exchange.** The request line and headers, the
   response status, wall time, content type, and a body preview, each at its own
-  verbosity. On iTerm2, an image response is previewed inline in the log.
+  verbosity. JSON request and response bodies are prettified in the log; on iTerm2,
+  an image response is previewed inline.
 - **A traceback when a handler throws.** An unhandled exception becomes a `500` and,
   when enabled, a demangled, symbolized stack trace in the log, instead of a silent
   drop.
@@ -73,6 +74,7 @@ curl -s localhost:8880/hello -H 'Accept: application/json'
 curl -s localhost:8880/hello -H 'Accept: text/html'
 curl -s --compressed localhost:8880/echo -d "$(head -c 4000 </dev/zero)"  # gzip
 curl -s localhost:8880/echo -XPOST -d 'hi'               # echoes the request
+curl -s localhost:8880/json -XPOST -d '{"a":[1,2],"b":{}}' -H 'Content-Type: application/json'  # prettified in the log
 curl -s localhost:8880/image -o /tmp/prism.png           # a PNG (previewed in the log)
 curl -s localhost:8880/boom                              # 500 + traceback in the log
 ```

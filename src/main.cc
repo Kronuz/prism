@@ -46,6 +46,7 @@
 namespace term {
 inline bool enabled() {
 	static const bool on = ::isatty(1) && [] {
+		if (const char* nc = std::getenv("NO_COLOR"); nc && *nc) return false;  // no-color.org
 		const char* t = std::getenv("TERM");
 		return t && std::string_view(t) != "dumb";
 	}();
@@ -180,13 +181,62 @@ struct Logger {
 	}
 };
 
-// A body preview for the log: text is shown (truncated), binary is summarized.
+// A structural JSON pretty-printer for the log. It re-indents rather than
+// validates: whitespace outside strings is normalized, string literals (with
+// their escapes) pass through untouched, and empty {} / [] stay on one line. Good
+// enough to make a minified request/response body readable in the verbose log.
+static std::string pretty_json(std::string_view in) {
+	std::string out;
+	out.reserve(in.size() + in.size() / 4);
+	int depth = 0;
+	bool in_str = false, esc = false, just_opened = false;
+	auto newline = [&](int d) { out += '\n'; out.append(std::size_t(d) * 2, ' '); };
+	for (char c : in) {
+		if (in_str) {
+			out += c;
+			if (esc) esc = false;
+			else if (c == '\\') esc = true;
+			else if (c == '"') in_str = false;
+			continue;
+		}
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;  // drop; we re-indent
+		// A pending newline from a just-opened container, unless it closes empty.
+		if (just_opened && c != '}' && c != ']') { newline(depth); }
+		just_opened = false;
+		switch (c) {
+			case '"': out += c; in_str = true; break;
+			case '{': case '[': out += c; ++depth; just_opened = true; break;
+			case '}': case ']': --depth; if (out.size() && out.back() != '{' && out.back() != '[') newline(depth); out += c; break;
+			case ',': out += c; newline(depth); break;
+			case ':': out += ": "; break;
+			default: out += c;
+		}
+	}
+	return out;
+}
+
+// A body preview for the log: JSON is prettified, other text is shown
+// (truncated), binary is summarized.
 static std::string preview_body(std::string_view ct, std::string_view body, std::size_t limit = 512) {
 	if (body.empty()) return term::dim() + "(empty)" + term::reset();
 	bool binary = ct.substr(0, 6) == "image/" || ct.find("octet-stream") != std::string_view::npos;
 	if (binary) return term::dim() + "(" + std::to_string(body.size()) + " bytes, " + std::string(ct) + ")" + term::reset();
-	std::string s(body.substr(0, limit));
-	if (body.size() > limit) s += term::dim() + " ...(+" + std::to_string(body.size() - limit) + " bytes)" + term::reset();
+	std::string text;
+	auto first = body.find_first_not_of(" \t\r\n");
+	bool looks_json = ct.find("json") != std::string_view::npos ||
+		(first != std::string_view::npos && (body[first] == '{' || body[first] == '['));
+	if (looks_json) {
+		std::string pretty = pretty_json(body);
+		// Re-indent multi-line JSON so continuation lines align under the log's
+		// 4-space body gutter.
+		std::string indented;
+		for (char c : pretty) { indented += c; if (c == '\n') indented += "    "; }
+		text = std::move(indented);
+	} else {
+		text = std::string(body);
+	}
+	std::string s = text.substr(0, limit);
+	if (text.size() > limit) s += term::dim() + " ...(+" + std::to_string(text.size() - limit) + " bytes)" + term::reset();
 	return s;
 }
 
@@ -281,6 +331,7 @@ public:
 				"  GET  /        this page\n"
 				"  GET  /hello   content-negotiated greeting (Accept: text/html | application/json | text/plain)\n"
 				"  ANY  /echo    echoes your request\n"
+				"  ANY  /json    echoes a JSON body (prettified in the verbose log)\n"
 				"  GET  /image   a spectrum PNG (previewed inline in the log on iTerm2)\n"
 				"  GET  /boom    raises an error -> 500 + traceback in the log\n");
 		});
@@ -302,6 +353,12 @@ public:
 		router_.route("GET", "/echo", echo);
 		router_.route("POST", "/echo", echo);
 		router_.route("PUT", "/echo", echo);
+		auto json_echo = [](const http::Request& req, http::ResponseWriter& resp, const http::Params&) {
+			std::string body = req.body.empty() ? "{\"posted\":null,\"from\":\"prism\"}" : req.body;
+			resp.send(200, body, "application/json");
+		};
+		router_.route("POST", "/json", json_echo);
+		router_.route("GET", "/json", json_echo);
 		router_.route("GET", "/image", [](const http::Request&, http::ResponseWriter& resp, const http::Params&) {
 			static const std::string png = b64decode(kPrismPngB64);
 			resp.send(200, png, "image/png");
