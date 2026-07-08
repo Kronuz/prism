@@ -85,38 +85,42 @@ static void banner(unsigned port, std::size_t reactors) {
 		return;
 	}
 	// The glass prism icon (left) and the "prism" wordmark (right, figlet
-	// Standard font). Backslashes are C++-escaped; rows are printed verbatim.
-	static const char* prism[6] = {
-		"        ",
-		"   /\\   ",
-		"  /  \\  ",
-		" /    \\ ",
-		"/______\\",
-		"        ",
+	// Standard font, with the "p" and "m" hand-stylized into descenders — the
+	// way Xapiand hand-stylizes its "X"). Backslashes are C++-escaped.
+	static const char* prism[7] = {
+		"          ",
+		"    /\\    ",
+		"   /  \\   ",
+		"  /    \\  ",
+		" /      \\ ",
+		"/________\\",
+		"          ",
 	};
-	static const char* word[6] = {
+	static const char* word[7] = {
 		"            _",
 		" _ __  _ __(_)___ _ __ ___",
 		"| '_ \\| '__| / __| '_ ` _ \\",
 		"| |_) | |  | \\__ \\ | | | | |",
-		"| .__/|_|  |_|___/_| |_| |_|",
-		"|_|",
+		"| .__/|_|  |_|___/_| |_| | |",
+		"| |                       \\|",
+		"|/",
 	};
-	// Colorless glass (top-lit), and the spectrum it disperses top-to-bottom.
-	static const int glass[6][3] = {
-		{0, 0, 0}, {240, 240, 240}, {215, 215, 215}, {190, 190, 190}, {165, 165, 165}, {0, 0, 0},
+	// Colorless glass (top-lit), and the spectrum it disperses top-to-bottom
+	// (the six stops, the last reused for the descender tail).
+	static const int glass[7][3] = {
+		{0, 0, 0}, {245, 245, 245}, {220, 220, 220}, {195, 195, 195}, {170, 170, 170}, {145, 145, 145}, {0, 0, 0},
 	};
 	static const int spectrum[6][3] = {
 		{233, 30, 99}, {255, 152, 0}, {255, 235, 59}, {76, 175, 80}, {33, 150, 243}, {103, 58, 183},
 	};
 	std::string b = "\n\n";
-	for (int i = 0; i < 6; ++i) {
+	for (int i = 0; i < 7; ++i) {
 		const auto& g = glass[i];
-		const auto& s = spectrum[i];
-		b += col::bfg(g[0], g[1], g[2]) + prism[i] + col::reset() + "  " +
+		const auto& s = spectrum[i < 6 ? i : 5];
+		b += col::bfg(g[0], g[1], g[2]) + prism[i] + col::reset() + " " +
 			col::bfg(s[0], s[1], s[2]) + word[i] + col::reset() + "\n";
 	}
-	b += "          " + col::grey() + "a flashy HTTP application server" + col::reset() + "\n\n";
+	b += "           " + col::grey() + "a flashy HTTP application server" + col::reset() + "\n\n";
 	b += "  " + col::fg(76, 175, 80) + "listening" + col::reset() + " http://127.0.0.1:" +
 		std::to_string(port) + "/   " + col::grey() + "(" + std::to_string(reactors) + " reactors)" + col::reset() + "\n";
 	L(-LOG_NOTICE, "{}", b);
