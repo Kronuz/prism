@@ -86,9 +86,30 @@ The throughput hit is small because prism has idle cores to absorb the logger's 
 
 The `http-log` middleware (`AccessLog`, used by prism *and* Xapiand) wrapped every response in a `CapturingWriter` that copied the headers and body **a second time, on every request** — even at `-q`, where the copy is then thrown away unlogged. The underlying `AsioResponseWriter` already buffers the full response (it must, to set `Content-Length`), and that buffer is still alive when the middleware logs.
 
-So the copy was redundant. The fix gives the writer a small `BufferedResponse` capability (`response_code/started/headers/body/content_type`) and has `AccessLog` read the response **back by reference** after `handle()` instead of wrapping and copying. The old `CapturingWriter` stays only as a fallback for a writer that doesn't retain its response.
+Three approaches, benchmarked head to head:
 
-Verified: request, response, and exception blocks are byte-identical; large bodies still render as a `<body N>` summary; the error path (`on_error` → 500 fallback → `L_EXC` at CRIT on a genuine 5xx) is unchanged. With a 63 KB response body, logging-on throughput is now within ~2.5% of logging-off (19,077 vs 19,565 req/s) — the per-request copy is gone. Xapiand's logged `SearchService` inherits the same win.
+- **A — copy always** (the original): wrap and copy every response, logged or not.
+- **B — gate the copy**: skip the copy when the running level would log nothing (a 3-line flag). Zero cost when logging is off; copies exactly like A when it's on.
+- **C — zero-copy**: give the writer a `BufferedResponse` capability (`response_code/started/headers/body/content_type`) and have `AccessLog` read the response **back by reference** after `handle()`. Never copies for a buffered writer; the `CapturingWriter` stays only as a fallback for a writer that doesn't retain its response.
+
+Measured as **CPU-time per request** (the reliable metric — throughput is harness-capped and indistinguishable across all three), Apple M4 Pro, `wrk -t6 -c256`:
+
+| Cell | A (copy) | B (gate) | C (zero-copy) |
+| --- | --- | --- | --- |
+| logging off, `/hello` 17 B | 41.4 µs | 41.7 µs | **41.2 µs** |
+| logging off, `/json` 63 KB | 66.2 µs | 64.1 µs | **63.3 µs** |
+| logging on, `/hello` 17 B | 61.2 µs | 61.3 µs | **60.1 µs** |
+| logging on, `/json` 63 KB | 85.5 µs | 85.9 µs | **84.2 µs** |
+
+The shape is exactly what the design predicts:
+
+- **Logging off**, big body: B and C both skip the wasted copy, ~3 µs under A (a 63 KB `memcpy` plus the header vector). A pays for a copy it then discards.
+- **Logging on**, big body: B's gate is open, so B copies like A (85.9 vs 85.5 µs); only **C** avoids it (84.2 µs). This is the case B doesn't help and C does.
+- **Tiny body**: all three within noise — the copy is a rounding error next to parsing, routing, framing, and the syscalls.
+
+So **C dominates B**: it does everything B does (zero cost when off) *and* the thing B can't (no copy when on), at strictly-lower-or-equal CPU in every cell. The absolute margins are small here (~2–4 %, a few µs) because on this loopback workload the copy is a small slice of the per-request cost, but it is free, consistent, scales with body and header size, and removes the double-buffer memory entirely — and it compounds on a CPU-bound host where the idle cores aren't there to hide it. C is what shipped.
+
+**Correctness (all three):** request, response, and exception blocks are byte-identical; large bodies still render as a `<body N>` summary; the error path (`on_error` → 500 fallback → `L_EXC` at CRIT on a genuine 5xx) is unchanged. Xapiand's logged `SearchService` inherits the win — it uses the same middleware and the same buffered writer, and its build compiles and smoke-tests clean against the change.
 
 ## Is it any good for production?
 
