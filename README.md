@@ -1,5 +1,7 @@
 # prism
 
+[![CI](https://github.com/Kronuz/prism/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/prism/actions/workflows/ci.yml)
+
 A flashy HTTP application server built on the Kronuz libraries. It is the part of a
 service that isn't your domain: the request runtime, content negotiation,
 transparent compression, conditional and range requests, a startup splash, and
