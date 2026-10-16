@@ -1,109 +1,94 @@
 # prism
 
 [![CI](https://github.com/Kronuz/prism/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/prism/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
 
-A flashy HTTP application server built on the Kronuz libraries. It is the part of a
-service that isn't your domain: the request runtime, content negotiation,
-transparent compression, conditional and range requests, a startup splash, and
-colored, leveled request/response logging with a formatted traceback when a handler
-throws. You bring the views; prism brings everything around them.
+The flashy app server: everything around your HTTP views, in C++20. Content
+negotiation, compression, conditional and range requests, colored request logs, and a
+traceback when a handler throws. You write the routes.
 
-It is two things at once: a **base to build an HTTP service on**, and a **worked
-example** of how the extracted Kronuz libraries fit together. The demo you get out
-of the box is small on purpose, so the wiring stays legible.
+<p align="center"><img src="assets/prism.png" alt="the spectrum image prism serves at /image" width="96"></p>
 
-## What you get
+## ✨ Highlights
 
-- **A real request runtime, not a toy loop.** HTTP/1.1 on standalone Asio with C++20
-  coroutines, a shared-nothing reactor pool (one per core), and an off-reactor
-  worker pool so a slow handler can't stall its co-located connections.
-- **Content negotiation.** One `/hello` view answers `application/json`, `text/html`,
-  or `text/plain` off the client's `Accept`.
-- **Transparent compression.** Responses over the size threshold are gzip/deflate
-  compressed when the client advertises it, with a correct `Vary: Accept-Encoding`.
-  Conditional (`ETag`/`If-*`) and range requests are on too.
-- **A banner on boot.** A glass-prism icon and the "prism" wordmark in figlet's
-  Standard font (the same font as Xapiand's "apiand"), the word split into a
-  spectrum, with the "p" and "m" hand-stylized into descenders and the tagline
-  ("the flashy app server") nestled inside the "m" descender, plus the address
-  it's listening on. It prints through the logger sink at NOTICE, gated by the log
-  level, the way Xapiand's `banner()` does.
-- **Colored, leveled logging of every exchange.** The request line and headers, the
-  response status, wall time, content type, and a body preview, each at its own
-  verbosity. JSON request and response bodies are prettified in the log; on iTerm2,
-  an image response is previewed inline. This runs on
-  [logger](https://github.com/Kronuz/logger) and
-  [term-color](https://github.com/Kronuz/term-color) (the same logging and color
-  stack Xapiand uses), so `--color`, `NO_COLOR`, and the tty check are handled for
-  you.
-- **A traceback when a handler throws.** An unhandled exception becomes a `500` and,
-  when enabled, a demangled, symbolized stack trace in the log, instead of a silent
-  drop. The trace is [traceback](https://github.com/Kronuz/traceback), wired into
-  the logger's backtrace hook exactly as Xapiand wires it.
+- ⚡ **A real runtime**: HTTP/1.1 on standalone Asio with C++20 coroutines, one
+  reactor per core, and a worker pool so a slow handler can't stall its neighbors.
+  About 51k req/s at 5 ms p99 on one M4 Pro, limited by the co-located load
+  generator ([BENCHMARKS.md](BENCHMARKS.md)).
+- 🤝 **Content negotiation**: one view answers JSON, HTML, or plain text from `Accept`.
+- 🗜️ **Transparent compression**: gzip or deflate with a correct
+  `Vary: Accept-Encoding`, plus `ETag`/`If-*` and range requests.
+- 🌈 **Colored, leveled logs** of every exchange: request line, headers, status, time,
+  and a prettified body preview; images preview inline on iTerm2.
+- 🧯 **Tracebacks, not silent 500s**: an unhandled exception logs a demangled stack
+  trace.
+- 🧩 **A worked example**: one `main.cc` shows how [http](https://github.com/Kronuz/http),
+  [reactor](https://github.com/Kronuz/reactor),
+  [logger](https://github.com/Kronuz/logger),
+  [term-color](https://github.com/Kronuz/term-color), and
+  [traceback](https://github.com/Kronuz/traceback) fit together.
 
-## Why it exists
+## 📦 Installation
 
-Every service re-implements this same outer shell: parse a port, stand up a server,
-negotiate encodings, log what came in and what went out, and turn a thrown exception
-into a response instead of a crash. Xapiand had a good version of that shell, but it
-was entangled with search and storage. prism is that shell pulled out clean, sitting
-on libraries you can use one at a time: [http](https://github.com/Kronuz/http) (the
-router, negotiation, compression, conditional/range handling) over
-[reactor](https://github.com/Kronuz/reactor) (the Asio runtime),
-[http-parser](https://github.com/Kronuz/http-parser),
-[radix-router](https://github.com/Kronuz/radix-router),
-[compressors](https://github.com/Kronuz/compressors),
-[logger](https://github.com/Kronuz/logger) +
-[term-color](https://github.com/Kronuz/term-color) (leveled, colored logging), and
-[traceback](https://github.com/Kronuz/traceback). It uses them the way Xapiand does,
-not a parallel re-implementation. The point of assembling them here is that the seams
-are visible: you can read one file and see how a request becomes a logged, negotiated,
-compressed response.
-
-## Build and run
+Requires a C++20 compiler and CMake 3.14 or newer; the dependencies are fetched at
+configure time.
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+git clone https://github.com/Kronuz/prism.git && cd prism
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+```
+
+## 🚀 Quick start
+
+```sh
 ./build/prism 8880 -v
 ```
 
-The dependencies are fetched at configure time via CMake `FetchContent`; you need a
-C++20 compiler and CMake 3.14+.
-
-```
-Usage: prism [PORT] [-v|-vv|-q] [--no-tracebacks]
-
-  PORT              port to listen on (default 8880)
-  -v                debug logging (request/response headers + body preview)
-  -vv               trace logging
-  -q                quiet (warnings and errors only)
-  --color=<mode>    auto (default) | always | never | truecolor | 256 | 16 | stacked
-  --no-color        alias for --color=never
-  --no-tracebacks   don't print a stack trace on an unhandled error
-```
-
-## The demo routes
+In another terminal:
 
 ```sh
-curl -s localhost:8880/                                  # welcome + route list
+curl -s localhost:8880/                                       # welcome and route list
 curl -s localhost:8880/hello -H 'Accept: application/json'
 curl -s localhost:8880/hello -H 'Accept: text/html'
-curl -s --compressed localhost:8880/echo -d "$(head -c 4000 </dev/zero)"  # gzip
-curl -s localhost:8880/echo -XPOST -d 'hi'               # echoes the request
-curl -s localhost:8880/json -XPOST -d '{"a":[1,2],"b":{}}' -H 'Content-Type: application/json'  # prettified in the log
-curl -s localhost:8880/image -o /tmp/prism.png           # a PNG (previewed in the log)
-curl -s localhost:8880/boom                              # 500 + traceback in the log
+curl -s --compressed localhost:8880/echo -d "$(head -c 4000 </dev/zero)"   # gzip
+curl -s localhost:8880/json -d '{"a":[1,2],"b":{}}' -H 'Content-Type: application/json'
+curl -s localhost:8880/image -o prism.png                     # previewed in the log
+curl -s localhost:8880/boom                                   # 500 + traceback in the log
 ```
 
-Run it under iTerm2 with `-v` and hit `/image` to see the response previewed inline
-in the log.
+## ⚙️ Configuration
 
-## How you'd build a service on it
+```
+prism [PORT] [-q | -v | -vv ...] [--color=MODE | --no-color] [--no-tracebacks]
 
-The application is a plain `http::Router` of views (`DemoApp` in `src/main.cc`). To
-make your own service you replace those routes with yours; the splash, logging,
-negotiation, compression, and error handling come along unchanged. The framework
-pieces here (the splash, the access-logging middleware, the lifecycle in `main`) are
-the natural next things to lift into their own libraries so the glue shrinks to just
-your views.
+  PORT              port to listen on (default 8880)
+  -q                warnings and errors only
+  -v, -vv, ...      one verbosity level above the default per v (requests log by default)
+  --color=MODE      auto (default), always, never, truecolor, 256, 16, or stacked
+  --no-color        same as --color=never; NO_COLOR is honored too
+  --no-tracebacks   no stack trace on an unhandled error
+```
+
+## 🎯 When to use it
+
+- ✅ A starting point for a small C++ HTTP service, or a map of how the Kronuz HTTP
+  libraries combine.
+- ❌ A turnkey production server: it serves plain HTTP/1.1 with no config file.
+  [http](https://github.com/Kronuz/http) has TLS, but prism doesn't wire it.
+
+## 📚 Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md): why it exists, each piece in detail, and how
+  to build your service on it.
+- [BENCHMARKS.md](BENCHMARKS.md): throughput, latency, and the cost of logging.
+- [AGENTS.md](AGENTS.md): repository map and conventions.
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first. CI must
+pass on every platform.
+
+## 📄 License
+
+MIT, Copyright (c) 2026 Germán Méndez Bravo. See [LICENSE](LICENSE).
