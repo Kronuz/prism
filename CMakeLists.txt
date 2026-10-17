@@ -19,24 +19,24 @@ FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.gi
 # transitively pulls reactor (the Asio server runtime), http-parser, radix-router,
 # and compressors (the response-compression codecs), so the whole request path
 # comes in with one dependency.
-FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG 40fc0d74fdf6cc77dcbcb8317f772018a6aa7bca)
+FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG d3b3667339c011e8b5d3a84be3958f450be266e4)
 FetchContent_MakeAvailable(http_lib)
 
 # Formatted crash tracebacks (capture + demangle + macOS file:line), for the
 # error path.
-FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG 3bebae3ff03c7a414553c97c8cef6d959946ab3a)
+FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG 689862139ab45bd0b9ff584f4084ed710b01784a)
 FetchContent_MakeAvailable(traceback)
 
 # The deferred, lock-free logger (leveled, colored, timestamped). It transitively
 # brings term-color (the stacked-escape palette + the collapse/apply resolution
 # the logger sink applies per --color/NO_COLOR/terminal) and scheduler, so prism's
 # whole logging + color stack is the same one Xapiand runs on.
-FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG 5bd491c41c8bad5d29c649ae0fbf28d7a7a5446d)
+FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG 8c5afcd89030586939dd5229ee2ae583069b83dd)
 FetchContent_MakeAvailable(logger)
 
 # The request/response logging middleware (recovers Xapiand's dropped to_text
 # logging): an http::HttpHandler decorator on http + logger + term-color.
-FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG 60d726f406acb6544f917641fd3b8d2baae5bc6c)
+FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG 090f3fbbebc067a3a9a62e64a2abf87289dbaf5d)
 FetchContent_MakeAvailable(http_log)
 
 add_executable(prism src/main.cc)
