@@ -61,6 +61,7 @@ curl -s localhost:8880/boom                                   # 500 + traceback 
 
 ```
 prism [PORT] [-q | -v | -vv ...] [--color=MODE | --no-color] [--no-tracebacks]
+      [--tls-cert=FILE --tls-key=FILE]
 
   PORT              port to listen on (default 8880)
   -q                warnings and errors only

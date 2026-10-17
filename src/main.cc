@@ -40,6 +40,10 @@
 #include "http_router.h"
 #include "http_asio.h"
 #include "traceback.h"
+#ifdef PRISM_TLS
+#include "http_asio_tls.h"  // http: the TLS connection factory
+#include "reactor_tls.h"    // reactor: TLS contexts (the Server role)
+#endif
 #include "colors.h"         // term-color: rgb()/brgb()/CLEAR_COLOR (stacked escapes)
 #include "color_tools.hh"   // term-color: the runtime color class
 #include "logger.h"         // Kronuz/logger: Logging, LogConfig, the L_* macros
@@ -80,7 +84,7 @@ static const char* kPrismPngB64 =
 // leaves the far side split into a spectrum, one rainbow stop per row.
 // (Phase 2: extract as Kronuz/splash, data driven by name/version/subtitle.)
 // ---------------------------------------------------------------------------
-static void banner(unsigned port, std::size_t reactors) {
+static void banner(unsigned port, std::size_t reactors, bool https) {
 	if (Logging::config.log_level < LOG_NOTICE) {
 		return;
 	}
@@ -130,7 +134,7 @@ static void banner(unsigned port, std::size_t reactors) {
 		}
 		b += "\n";
 	}
-	b += "\n  " + col::fg(76, 175, 80) + "listening" + col::reset() + " http://127.0.0.1:" +
+	b += "\n  " + col::fg(76, 175, 80) + "listening" + col::reset() + (https ? " https://127.0.0.1:" : " http://127.0.0.1:") +
 		std::to_string(port) + "/   " + col::grey() + "(" + std::to_string(reactors) + " reactors)" + col::reset() + "\n";
 	L(-LOG_NOTICE, "{}", b);
 }
@@ -233,6 +237,7 @@ int main(int argc, char** argv) {
 	int log_level = LOG_NOTICE;   // default: request/response lines
 	bool tracebacks = true;
 	std::string color = "auto";
+	std::string tls_cert, tls_key;  // --tls-cert=FILE --tls-key=FILE: serve HTTPS
 	for (int i = 1; i < argc; ++i) {
 		std::string a = argv[i];
 		if (a == "-q") log_level = LOG_WARNING;          // warnings + errors only
@@ -244,6 +249,8 @@ int main(int argc, char** argv) {
 			// any run of v's is why `prism -vvvv` is no longer silently ignored.
 			log_level = LOG_NOTICE + static_cast<int>(a.size()) - 1;
 		}
+		else if (a.rfind("--tls-cert=", 0) == 0) tls_cert = a.substr(11);
+		else if (a.rfind("--tls-key=", 0) == 0) tls_key = a.substr(10);
 		else if (a == "--no-tracebacks") tracebacks = false;
 		else if (a == "--no-color") color = "never";
 		else if (a.rfind("--color=", 0) == 0) color = a.substr(8);
@@ -258,6 +265,7 @@ int main(int argc, char** argv) {
 	Logging::config.timestamp = LogTimestamp::iso8601;
 	Logging::config.precision = LogPrecision::milliseconds;
 	Logging::config.timestamp_gradient = true;
+	Logging::config.tint = true;  // each message in its severity's color, as Xapiand's
 	if (color == "never" || color == "off") {
 		Logging::config.color = LogColorMode::never;
 	} else if (color == "always" || color == "on") {
@@ -294,7 +302,29 @@ int main(int argc, char** argv) {
 	};
 	http_log::AccessLog access(app, std::move(logopts));
 
-	http::HttpAsioService service(access, reactors, /*workers=*/2, /*queue_limit=*/256);
+	// HTTPS with a certificate and key alone: reactor's TLS Server role needs no authority.
+	if (tls_cert.empty() != tls_key.empty()) {
+		L_ERR("--tls-cert and --tls-key go together");
+		Logging::finish();
+		return 2;
+	}
+	const bool https = !tls_cert.empty();
+	std::unique_ptr<http::HttpAsioService> listener;
+	if (https) {
+#ifdef PRISM_TLS
+		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		reactor::tls::configure(*context, reactor::tls::Options{tls_cert, tls_key, ""}, reactor::tls::Role::Server);
+		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*workers=*/2, /*queue_limit=*/256,
+			http::tls_connection_factory_timed(context), /*maximum_connections=*/1024);
+#else
+		L_ERR("this prism was built without TLS (OpenSSL 3 was not found)");
+		Logging::finish();
+		return 2;
+#endif
+	} else {
+		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*workers=*/2, /*queue_limit=*/256);
+	}
+	http::HttpAsioService& service = *listener;
 	service.enable_compression();
 	service.enable_conditional();
 	service.enable_ranges();
@@ -303,7 +333,7 @@ int main(int argc, char** argv) {
 	std::signal(SIGTERM, on_signal);
 
 	service.start(static_cast<unsigned short>(port));
-	banner(port, reactors);
+	banner(port, reactors, https);
 	L_NOTICE(col::grey() + "ready -- Ctrl-C to stop" + col::reset());
 
 	while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
