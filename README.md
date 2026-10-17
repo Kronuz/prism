@@ -69,14 +69,19 @@ prism [PORT] [-q | -v | -vv ...] [--color=MODE | --no-color] [--no-tracebacks]
   --color=MODE      auto (default), always, never, truecolor, 256, 16, or stacked
   --no-color        same as --color=never; NO_COLOR is honored too
   --no-tracebacks   no stack trace on an unhandled error
+  --tls-cert=FILE   serve HTTPS with this PEM certificate chain and the key below
+  --tls-key=FILE    (no certificate authority needed; built when OpenSSL 3 is found)
 ```
+
+Log lines are tinted by severity, and each exchange logs as one colored block: the look
+Xapiand's logs have, from the same libraries.
 
 ## 🎯 When to use it
 
 - ✅ A starting point for a small C++ HTTP service, or a map of how the Kronuz HTTP
   libraries combine.
-- ❌ A turnkey production server: it serves plain HTTP/1.1 with no config file.
-  [http](https://github.com/Kronuz/http) has TLS, but prism doesn't wire it.
+- ❌ A turnkey production server: it serves HTTP/1.1, or HTTPS with a certificate you
+  provide, with no config file.
 
 ## 📚 Documentation
 
