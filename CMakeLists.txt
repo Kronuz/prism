@@ -13,13 +13,13 @@ include(FetchContent)
 
 # Dependencies are pinned to commits. reactor is declared first (FetchContent's first
 # declaration wins) for its TLS Server role without an authority, which --tls-cert uses.
-FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG 67e22a66877e6bf4934273eae0b292b0d7daed5f)
+FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG d442d879f3462d919a30899934c5edcc9f9a1deb)
 
 # The HTTP/1.1 application framework on standalone Asio (C++20 coroutines). It
 # transitively pulls reactor (the Asio server runtime), http-parser, radix-router,
 # and compressors (the response-compression codecs), so the whole request path
 # comes in with one dependency.
-FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG c05b4d385bd0bcf00eaae4011fe4d34db9abdf99)
+FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG 345cfe0d7b4857e1ca81e784b56978fbdc1911eb)
 FetchContent_MakeAvailable(http_lib)
 
 # Formatted crash tracebacks (capture + demangle + macOS file:line), for the
@@ -36,7 +36,7 @@ FetchContent_MakeAvailable(logger)
 
 # The request/response logging middleware (recovers Xapiand's dropped to_text
 # logging): an http::HttpHandler decorator on http + logger + term-color.
-FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG c7772abeeb69f1a5347359b679ef920bae12eae7)
+FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG 8e23d92b165293908e011d762f450a45cd329c06)
 FetchContent_MakeAvailable(http_log)
 
 add_executable(prism src/main.cc)
