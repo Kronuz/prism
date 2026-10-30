@@ -183,7 +183,7 @@ class DemoApp : public http::HttpHandler {
 	http::Router router_;
 public:
 	DemoApp() {
-		router_.route("GET", "/", [](const http::Request&, http::ResponseWriter& resp, const http::Params&) {
+		router_.route("GET", "/", [](http::Request&, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
 			resp.send(200,
 				"prism -- a flashy HTTP application server\n\n"
 				"  GET  /        this page\n"
@@ -192,8 +192,9 @@ public:
 				"  ANY  /json    echoes a JSON body (prettified in the verbose log)\n"
 				"  GET  /image   a spectrum PNG (previewed inline in the log on iTerm2)\n"
 				"  GET  /boom    raises an error -> 500 + traceback in the log\n");
+			co_return;
 		});
-		router_.route("GET", "/hello", [](const http::Request& req, http::ResponseWriter& resp, const http::Params&) {
+		router_.route("GET", "/hello", [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
 			auto accept = req.header("Accept");
 			if (accept.find("application/json") != std::string_view::npos)
 				resp.send(200, "{\"hello\":\"world\",\"from\":\"prism\"}\n", "application/json");
@@ -201,31 +202,36 @@ public:
 				resp.send(200, "<h1>hello from <em>prism</em></h1>\n", "text/html; charset=utf-8");
 			else
 				resp.send(200, "hello from prism\n");
+			co_return;
 		});
-		auto echo = [](const http::Request& req, http::ResponseWriter& resp, const http::Params&) {
+		auto echo = [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
 			std::string out = req.method + " " + req.path + "\n";
 			for (auto& [k, v] : req.headers) { out += k; out += ": "; out += v; out += "\n"; }
 			if (!req.body.empty()) { out += "\n"; out += req.body; out += "\n"; }
 			resp.send(200, out);
+			co_return;
 		};
 		router_.route("GET", "/echo", echo);
 		router_.route("POST", "/echo", echo);
 		router_.route("PUT", "/echo", echo);
-		auto json_echo = [](const http::Request& req, http::ResponseWriter& resp, const http::Params&) {
+		auto json_echo = [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
 			std::string body = req.body.empty() ? "{\"posted\":null,\"from\":\"prism\"}" : req.body;
 			resp.send(200, body, "application/json");
+			co_return;
 		};
 		router_.route("POST", "/json", json_echo);
 		router_.route("GET", "/json", json_echo);
-		router_.route("GET", "/image", [](const http::Request&, http::ResponseWriter& resp, const http::Params&) {
+		router_.route("GET", "/image", [](http::Request&, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
 			static const std::string png = cppcodec::base64_rfc4648::decode<std::string>(std::string_view(kPrismPngB64));
 			resp.send(200, png, "image/png");
+			co_return;
 		});
-		router_.route("GET", "/boom", [](const http::Request&, http::ResponseWriter&, const http::Params&) {
+		router_.route("GET", "/boom", [](http::Request&, http::ResponseWriter&, const http::Params&) -> asio::awaitable<void> {
 			throw std::runtime_error("the /boom route always raises");
+			co_return;
 		});
 	}
-	void handle(const http::Request& req, http::ResponseWriter& resp) override { router_.handle(req, resp); }
+	asio::awaitable<void> handle(http::Request& req, http::ResponseWriter& resp) override { co_await router_.handle(req, resp); }
 };
 
 // ---------------------------------------------------------------------------
@@ -314,7 +320,7 @@ int main(int argc, char** argv) {
 #ifdef PRISM_TLS
 		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
 		reactor::tls::configure(*context, reactor::tls::Options{tls_cert, tls_key, ""}, reactor::tls::Role::Server);
-		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*workers=*/2, /*queue_limit=*/256,
+		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*in_flight_limit=*/256,
 			http::tls_connection_factory_timed(context), /*maximum_connections=*/1024);
 #else
 		L_ERR("this prism was built without TLS (OpenSSL 3 was not found)");
@@ -322,7 +328,7 @@ int main(int argc, char** argv) {
 		return 2;
 #endif
 	} else {
-		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*workers=*/2, /*queue_limit=*/256);
+		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*in_flight_limit=*/256);
 	}
 	http::HttpAsioService& service = *listener;
 	service.enable_compression();

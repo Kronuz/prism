@@ -25,8 +25,8 @@ compressed response.
 ## The pieces in detail
 
 - **A real request runtime, not a toy loop.** HTTP/1.1 on standalone Asio with C++20
-  coroutines, a shared-nothing reactor pool (one per core), and an off-reactor
-  worker pool so a slow handler can't stall its co-located connections.
+  coroutines, a shared-nothing reactor pool (one per core), and coroutine handlers that
+  suspend instead of block, so a slow handler can't stall its co-located connections.
 - **Content negotiation.** One `/hello` view answers `application/json`, `text/html`,
   or `text/plain` off the client's `Accept`.
 - **Transparent compression.** Responses over the size threshold are gzip/deflate

@@ -15,7 +15,7 @@ traceback when a handler throws. You write the routes.
 ## ✨ Highlights
 
 - ⚡ **A real runtime**: HTTP/1.1 on standalone Asio with C++20 coroutines, one
-  reactor per core, and a worker pool so a slow handler can't stall its neighbors.
+  reactor per core, and coroutine handlers that suspend instead of block, so a slow handler can't stall its neighbors.
   About 51k req/s at 5 ms p99 on one M4 Pro, limited by the co-located load
   generator ([BENCHMARKS.md](BENCHMARKS.md)).
 - 🤝 **Content negotiation**: one view answers JSON, HTML, or plain text from `Accept`.
