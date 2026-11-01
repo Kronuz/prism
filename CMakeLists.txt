@@ -13,30 +13,30 @@ include(FetchContent)
 
 # Dependencies are pinned to commits. reactor is declared first (FetchContent's first
 # declaration wins) for its TLS Server role without an authority, which --tls-cert uses.
-FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG 76c32b44de7632909e1287c76ea0f36c5f75d695)
+FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG 4083bdb770fe7a364c5f86d63ce672a7a4ad3729)
 
 # The HTTP/1.1 application framework on standalone Asio (C++20 coroutines). It
 # transitively pulls reactor (the Asio server runtime), http-parser, radix-router,
 # and compressors (the response-compression codecs), so the whole request path
 # comes in with one dependency.
-FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG fce24c639692bee7dee97f39303ad32ca54014d0)
+FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG e70ba3494e42547c91013e592232ff31d26ebc09)
 FetchContent_MakeAvailable(http_lib)
 
 # Formatted crash tracebacks (capture + demangle + macOS file:line), for the
 # error path.
-FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG 689862139ab45bd0b9ff584f4084ed710b01784a)
+FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG c2ab6dd3a2a984ad10d5ea238404118e0753a98c)
 FetchContent_MakeAvailable(traceback)
 
 # The deferred, lock-free logger (leveled, colored, timestamped). It transitively
 # brings term-color (the stacked-escape palette + the collapse/apply resolution
 # the logger sink applies per --color/NO_COLOR/terminal) and scheduler, so prism's
 # whole logging + color stack is the same one Xapiand runs on.
-FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG 8c5afcd89030586939dd5229ee2ae583069b83dd)
+FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG 89e894119884da6dc52b0e502a87046c11a83445)
 FetchContent_MakeAvailable(logger)
 
 # The request/response logging middleware (recovers Xapiand's dropped to_text
 # logging): an http::HttpHandler decorator on http + logger + term-color.
-FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG d2315b86ee0483c0b2fa8b25f82e79e64e40b33d)
+FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG ff09a32d0d22abb6c60bbd5b27122b522769eb18)
 FetchContent_MakeAvailable(http_log)
 
 add_executable(prism src/main.cc)
