@@ -19,25 +19,25 @@ FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.gi
 # transitively pulls reactor (the Asio server runtime), http-parser, radix-router,
 # and compressors (the response-compression codecs), so the whole request path
 # comes in with one dependency.
-FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG 8c5c66842ddad86185d79bed05690e73375896f6)
+FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG d76c5efa4d4c4ae1a181780f593dc6b06786c9a5)
 FetchContent_MakeAvailable(http_lib)
 
 # The deferred, lock-free logger (leveled, colored, timestamped). It transitively
 # brings term-color (the stacked-escape palette + the collapse/apply resolution
 # the logger sink applies per --color/NO_COLOR/terminal) and scheduler, so prism's
 # whole logging + color stack is the same one Xapiand runs on.
-FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG bb2d16c84de4e5316be42ec05783e43c2f144844)
+FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG dec78b5aa0aedea5a2dd6ce8327e05e3a2174435)
 FetchContent_MakeAvailable(logger)
 
 # The request/response logging middleware (recovers Xapiand's dropped to_text
 # logging): an http::HttpHandler decorator on http + logger + term-color.
-FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG d0209746331e2c96dab049b83e5e2fff6d37d96d)
+FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG b203bdd8ceed5ab03cbbe66411032c652e65d253)
 FetchContent_MakeAvailable(http_log)
 
 # Formatted crash tracebacks (capture + demangle + macOS file:line), for the
 # error path. Declared after http-log: traceback pins its own strings, and the
 # first declaration wins, so http-log's newer strings and repr must come first.
-FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG c2ab6dd3a2a984ad10d5ea238404118e0753a98c)
+FetchContent_Declare(traceback GIT_REPOSITORY https://github.com/Kronuz/traceback.git GIT_TAG b607242049aa996132a4544a018dafc3bbc71245)
 FetchContent_MakeAvailable(traceback)
 
 add_executable(prism src/main.cc)
