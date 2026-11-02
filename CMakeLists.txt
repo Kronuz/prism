@@ -26,12 +26,12 @@ FetchContent_MakeAvailable(http_lib)
 # brings term-color (the stacked-escape palette + the collapse/apply resolution
 # the logger sink applies per --color/NO_COLOR/terminal) and scheduler, so prism's
 # whole logging + color stack is the same one Xapiand runs on.
-FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG dec78b5aa0aedea5a2dd6ce8327e05e3a2174435)
+FetchContent_Declare(logger GIT_REPOSITORY https://github.com/Kronuz/logger.git GIT_TAG 765528e977b59e97b0ebf79738f9bf9041635c61)
 FetchContent_MakeAvailable(logger)
 
 # The request/response logging middleware (recovers Xapiand's dropped to_text
 # logging): an http::HttpHandler decorator on http + logger + term-color.
-FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG b203bdd8ceed5ab03cbbe66411032c652e65d253)
+FetchContent_Declare(http_log GIT_REPOSITORY https://github.com/Kronuz/http-log.git GIT_TAG 8a38bb0efdc5ab4e55951e222345e18efa68f924)
 FetchContent_MakeAvailable(http_log)
 
 # Formatted crash tracebacks (capture + demangle + macOS file:line), for the
