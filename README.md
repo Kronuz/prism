@@ -102,6 +102,8 @@ Not for:
 
 ## 📚 Documentation
 
+- [Everything but the Views](https://kronuz.github.io/blog/prism/):
+  the Familiars post on why it exists and how it works.
 - [ARCHITECTURE.md](ARCHITECTURE.md): why it exists, each piece in detail, and how
   to build your service on it.
 - [BENCHMARKS.md](BENCHMARKS.md): throughput, latency, and the cost of logging,
