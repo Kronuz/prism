@@ -37,7 +37,7 @@ service, or as the worked example of how the libraries fit together.
 ## 🚀 Quick start
 
 ```sh
-./build/prism 8880 -v
+./build/prism --port 8880 -v
 ```
 
 In another terminal:
@@ -55,17 +55,33 @@ curl -s localhost:8880/boom                                   # 500 + traceback 
 The options:
 
 ```text
-prism [PORT] [-q | -v | -vv ...] [--color=MODE | --no-color] [--no-tracebacks]
-      [--tls-cert=FILE --tls-key=FILE]
+prism [--config FILE] [--port N] [--bind-address ADDR] [--reactors N]
+      [--max-clients N] [--max-in-flight N] [--idle-timeout-ms MS]
+      [--shutdown-timeout-ms MS] [--tls-cert FILE --tls-key FILE]
+      [--daemonize] [--runtime-dir DIR] [-q | -v | -vv ... | --verbosity N]
+      [--color MODE | --no-color] [--no-tracebacks]
 
-  PORT              port to listen on (default 8880)
+  --config FILE     prism.json: the same options as keys (max_clients, idle_timeout_ms, ...);
+                    flags override it, and its relative paths are relative to the file
+  --port N          port to listen on (default 8880; 0 binds a free port)
+  --bind-address A  address to listen on (default every interface)
+  --reactors N      event loops (default one per hardware thread)
+  --max-clients N   open connections, plain and TLS (default 1024)
+  --max-in-flight N requests admitted per loop (default 1024; 0 is no cap)
+  --idle-timeout-ms MS          close an idle connection (default 75000; 0 is off)
+  --shutdown-timeout-ms MS      bound on a stop (default 35000)
+  --tls-cert FILE   serve HTTPS with this PEM certificate chain and the key below
+  --tls-key FILE    the private key file (no certificate authority needed; built when OpenSSL 3 is found)
+  --daemonize       detach once serving, logging to RUNTIME_DIR/prism-PORT.log
+  --runtime-dir DIR where prism-PORT.pid is locked while prism runs
   -q                warnings and errors only
   -v, -vv, ...      one verbosity level above the default per v (requests log by default)
-  --color=MODE      auto (default), always, never, truecolor, 256, 16, or stacked
-  --no-color        same as --color=never; NO_COLOR is honored too
+  --color MODE      auto (default), always, never, truecolor, 256, 16, or stacked
+  --no-color        same as --color never; NO_COLOR is honored too
   --no-tracebacks   no stack trace on an unhandled error
-  --tls-cert=FILE   serve HTTPS with this PEM certificate chain and the key below
-  --tls-key=FILE    (no certificate authority needed; built when OpenSSL 3 is found)
+
+SIGINT or SIGTERM stops (requests in flight finish), a second one hurries, a third
+flushes and dies.
 ```
 
 ## 📦 Installation
@@ -119,8 +135,9 @@ cmake --build build
 ./build/prism
 ```
 
-prism has no test suite of its own; the libraries it assembles carry theirs, and
-CI builds prism on every platform.
+`ctest --test-dir build` runs prism's lifecycle test (readiness, the pid lock, and a
+SIGTERM under load); the libraries it assembles carry their own suites, and CI builds
+and tests prism on every platform.
 
 ## 🤝 Contributing
 

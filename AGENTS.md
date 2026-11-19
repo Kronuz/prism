@@ -6,7 +6,9 @@ example of how they fit together.
 ## Repo map
 
 ```
-src/main.cc          The whole app: banner, access-logging middleware, DemoApp routes, main().
+src/main.cc          The whole app: banner, DemoApp routes, options, and main() composed per
+                     cpp-libraries' server-composition note (ARCHITECTURE.md).
+src/test/            The lifecycle test: runs the built prism (ctest prism_lifecycle).
 assets/prism.png     The 48x48 spectrum PNG that /image serves; shown in the README.
 assets/prism.png.b64 Its base64, pasted into kPrismPngB64 in main.cc (not read by the build).
 BENCHMARKS.md        Throughput, latency, logging cost (2026-07-08, M4 Pro).
@@ -26,7 +28,8 @@ ARCHITECTURE.md      Why it exists, the pieces, and how to build a service on it
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
-./build/prism 8880 -v &
+./build/prism --port 8880 -v &
 curl -s localhost:8880/hello -H 'Accept: application/json' && curl -s localhost:8880/boom
 kill %1
+ctest --test-dir build --output-on-failure
 ```

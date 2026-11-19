@@ -100,10 +100,10 @@ Where Prism's code path still differs from the note, and why:
 
 | Deviation | Reason | Status |
 | :---- | :---- | :---- |
-| Bounds set by the constructor and setters, not one `http::Limits` | http has no `Limits` yet (Xapiand quest http-limits) | Goes with http-limits |
-| No descriptor check | reactor has no `raise_open_files` yet (Xapiand quest reactor-server-composition); the reserve will be 64 | Goes with reactor-server-composition |
-| `configure` instead of `tls::server_context`, so a group-readable key, an expired certificate and `strict` are not checked | reactor has no `server_context` yet (reactor-server-composition) | Goes with reactor-server-composition |
-| `Http::stop()` closes nothing, and the drain runs http's stop, which cancels the requests in flight at once (their responses are still written) and blocks the loop for the grace | http has no `stop_accepting()` and reactor no stop phases yet; the grace is the smaller of 5 s and the bound, so the bound holds | Goes with http-limits |
+| Bounds set by the constructor and setters, not one `http::Limits` | http has no `Limits` yet (Xapiand quest http-limits) | Goes in Detent quest prism-server-composition-limits, after http-limits |
+| No descriptor check | reactor has no `raise_open_files` yet (Xapiand quest reactor-server-composition); the reserve will be 64 | Goes in Detent quest prism-server-composition-limits, after reactor-server-composition |
+| `configure` instead of `tls::server_context`, so a group-readable key, an expired certificate and `strict` are not checked | reactor has no `server_context` yet (reactor-server-composition) | Goes in Detent quest prism-server-composition-limits, after reactor-server-composition |
+| `Http::stop()` closes nothing, and the drain runs http's stop, which cancels the requests in flight at once (their responses are still written) and blocks the loop for the grace | http has no `stop_accepting()` and reactor no stop phases yet; the grace is the smaller of 5 s and the bound, so the bound holds | Goes in Detent quest prism-server-composition-limits, after http-limits |
 | The configuration file only by `--config`, with no default directory | Prism installs nowhere, so it has no configuration directory | Stays |
 | No privilege drop | Prism has no `--uid` or `--gid` | Stays |
 | TLS compiled out | OpenSSL 3 is optional | Stays: a build option |
