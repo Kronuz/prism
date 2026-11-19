@@ -130,7 +130,7 @@ Both live in the shared reactor/http stack, so prism and Xapiand would gain them
 
 ```sh
 # server, logging off
-./build/prism -q 8880 --no-color
+./build/prism -q --port 8880 --no-color
 
 # peak throughput + latency
 wrk -t6 -c256 -d15s --latency http://127.0.0.1:8880/hello

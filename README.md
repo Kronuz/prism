@@ -80,8 +80,11 @@ prism [--config FILE] [--port N] [--bind-address ADDR] [--reactors N]
   --no-color        same as --color never; NO_COLOR is honored too
   --no-tracebacks   no stack trace on an unhandled error
 
-SIGINT or SIGTERM stops (requests in flight finish), a second one hurries, a third
-flushes and dies.
+SIGINT or SIGTERM stops: a response being written gets the grace (5 s, at most the
+shutdown bound), then its connection closes; a request still being received is reset
+with no response. A second signal changes nothing yet, and a third flushes and dies.
+Finishing those requests and hurrying on the second signal come with http's
+stop_accepting() (Detent quest prism-server-composition-limits).
 ```
 
 ## 📦 Installation

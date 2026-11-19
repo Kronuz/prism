@@ -3,6 +3,8 @@
 //           instance leaves it alone, and SIGTERM stops it and releases the lock.
 //   load    SIGTERM while clients hammer it and a slow reader is mid-response: that response
 //           arrives whole, no response is cut short, and prism exits 0 within the shutdown bound.
+//   stalled SIGTERM while a peer never reads its 4 MiB response: prism still exits 0 within a
+//           2 s shutdown bound, cutting that connection.
 
 #include <algorithm>
 #include <atomic>
@@ -275,6 +277,48 @@ void load_test() {
 		static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
 }
 
+// The status of `pid` once it exits, or nullopt after `bound` (then it is killed and reaped).
+std::optional<int> exit_within(pid_t pid, std::chrono::milliseconds bound) {
+	int status = 0;
+	if (!eventually(bound, [&] { return ::waitpid(pid, &status, WNOHANG) == pid; })) {
+		::kill(pid, SIGKILL);
+		exit_status(pid);
+		return std::nullopt;
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+void stalled_test() {
+	const auto dir = scratch / "stalled";
+	const unsigned short port = free_port();
+	const auto bound = 2s;
+	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "1",
+		"--shutdown-timeout-ms", std::to_string(std::chrono::milliseconds(bound).count()), "-q"});
+	int probe = -1;
+	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
+	if (probe < 0) { ::kill(child, SIGKILL); exit_status(child); return; }
+	::close(probe);
+
+	// A peer that reads the response's first bytes, then nothing: the write stalls on it.
+	std::string body(4u << 20, 'x');
+	int fd = connect_to(port, 16 * 1024);
+	CHECK(fd >= 0 && send_all(fd, request("POST", "/echo", body)));
+	char head[1024];
+	CHECK(fd >= 0 && ::recv(fd, head, sizeof(head), 0) > 0);
+	std::this_thread::sleep_for(200ms);
+
+	const auto signalled = clock_type::now();
+	CHECK(::kill(child, SIGTERM) == 0);
+	const auto status = exit_within(child, 10s);
+	const auto took = clock_type::now() - signalled;
+	if (fd >= 0) { ::close(fd); }
+	CHECK(status == 0);
+	CHECK(took < bound + 1s);
+	std::fprintf(stderr, "stalled: exit %d %lld ms after SIGTERM (bound %lld ms)\n", status.value_or(-1),
+		static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()),
+		static_cast<long long>(std::chrono::milliseconds(bound).count()));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -292,6 +336,7 @@ int main(int argc, char** argv) {
 	scratch = tmpl;
 	daemon_test();
 	load_test();
+	stalled_test();
 	std::error_code ec;
 	if (!failures) { std::filesystem::remove_all(scratch, ec); }
 	std::fprintf(stderr, failures ? "FAILED: %d checks\n" : "passed\n", failures);

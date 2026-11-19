@@ -289,8 +289,10 @@ const char* kUsage =
 	"prism.json (--config) holds the same options as keys: max_clients, idle_timeout_ms, ...;\n"
 	"flags override it, and its relative paths are relative to the file. The TLS key is\n"
 	"the private file. --daemonize detaches once serving, logging to RUNTIME_DIR/prism-PORT.log;\n"
-	"RUNTIME_DIR/prism-PORT.pid is locked while prism runs. SIGINT or SIGTERM stops,\n"
-	"a second one hurries, a third flushes and dies.\n";
+	"RUNTIME_DIR/prism-PORT.pid is locked while prism runs. SIGINT or SIGTERM stops:\n"
+	"a response being written gets the grace (5 s, at most the shutdown bound), then its\n"
+	"connection closes; a request still being received is reset with no response. A second\n"
+	"signal changes nothing yet; a third flushes and dies.\n";
 
 std::uint64_t unsigned_value(const std::string& key, const std::string& value, std::uint64_t minimum, std::uint64_t maximum) {
 	std::uint64_t n = 0;
@@ -555,6 +557,12 @@ int main(int argc, char** argv) {
 		return EX_CONFIG;
 	}
 	const auto log = o.runtime_dir / ("prism-" + std::to_string(o.port) + ".log");
+	for (const auto& file : {o.tls_cert, o.tls_key}) {  // before the fork, so a detached start exits EX_CONFIG too
+		if (!file.empty() && !std::ifstream(file)) {
+			std::fprintf(stderr, "prism: TLS: cannot read %s\n", file.c_str());
+			return EX_CONFIG;
+		}
+	}
 	try {
 		return task::run_daemon(o.daemonize, log, [&](const task::daemon_ready& ready) { return serve(o, ready); });
 	} catch (const config_error& e) {
