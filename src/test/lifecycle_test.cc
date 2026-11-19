@@ -1,0 +1,299 @@
+// Runs the built prism (argv[1]) through the shared lifecycle:
+//   daemon  --daemonize returns once prism serves; the pid file is locked while it runs, a second
+//           instance leaves it alone, and SIGTERM stops it and releases the lock.
+//   load    SIGTERM while clients hammer it and a slow reader is mid-response: that response
+//           arrives whole, no response is cut short, and prism exits 0 within the shutdown bound.
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <csignal>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <optional>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "process.hh"  // task::locked_pid
+
+namespace {
+
+using clock_type = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+int failures = 0;
+#define CHECK(cond)                                                                \
+	do {                                                                           \
+		if (!(cond)) {                                                             \
+			std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
+			++failures;                                                            \
+		}                                                                          \
+	} while (0)
+
+std::string prism;
+std::filesystem::path scratch;
+
+unsigned short free_port() {
+	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+	sockaddr_in a{};
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+	socklen_t n = sizeof(a);
+	::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &n);
+	::close(fd);
+	return ntohs(a.sin_port);
+}
+
+pid_t spawn(std::vector<std::string> args) {
+	args.insert(args.begin(), prism);
+	pid_t pid = ::fork();
+	if (pid == 0) {
+		std::vector<char*> argv;
+		for (auto& a : args) { argv.push_back(a.data()); }
+		argv.push_back(nullptr);
+		::execv(argv[0], argv.data());
+		::_exit(127);
+	}
+	return pid;
+}
+
+int exit_status(pid_t pid) {
+	int status = 0;
+	while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+int connect_to(unsigned short port, int rcvbuf = 0) {
+	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+	if (rcvbuf) { ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)); }
+	sockaddr_in a{};
+	a.sin_family = AF_INET;
+	a.sin_port = htons(port);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+		::close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+bool send_all(int fd, const std::string& bytes) {
+	std::size_t sent = 0;
+	while (sent < bytes.size()) {
+		auto n = ::send(fd, bytes.data() + sent, bytes.size() - sent, 0);
+		if (n < 0 && errno == EINTR) { continue; }
+		if (n <= 0) { return false; }
+		sent += std::size_t(n);
+	}
+	return true;
+}
+
+std::string request(const std::string& method, const std::string& path, const std::string& body = {}) {
+	return method + " " + path + " HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+}
+
+// One response read off a connection. `started` once any byte came; `whole` once the head and
+// Content-Length bytes of body came. `pace` reads `chunk` bytes at a time with a sleep between.
+struct Response {
+	bool started = false, whole = false;
+	int status = 0;
+	std::string body;
+};
+
+struct Reader {
+	int fd;
+	std::string buffered;
+	std::size_t chunk = 64 * 1024;
+	std::chrono::milliseconds pace{0};
+	std::function<void()> on_head;  // once the head is in
+
+	bool fill() {
+		if (pace.count()) { std::this_thread::sleep_for(pace); }
+		std::string b(chunk, '\0');
+		auto n = ::recv(fd, b.data(), b.size(), 0);
+		while (n < 0 && errno == EINTR) { n = ::recv(fd, b.data(), b.size(), 0); }
+		if (n <= 0) { return false; }
+		buffered.append(b.data(), std::size_t(n));
+		return true;
+	}
+
+	Response read() {
+		Response r;
+		std::size_t end;
+		while ((end = buffered.find("\r\n\r\n")) == std::string::npos) {
+			if (!fill()) { r.started = !buffered.empty(); return r; }
+		}
+		r.started = true;
+		const std::string head = buffered.substr(0, end);
+		buffered.erase(0, end + 4);
+		r.status = std::atoi(head.c_str() + head.find(' ') + 1);
+		std::string lower = head;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+		const auto at = lower.find("\r\ncontent-length:");
+		const std::size_t length = at == std::string::npos ? 0 : std::strtoull(head.c_str() + at + 17, nullptr, 10);
+		if (on_head) { on_head(); }
+		while (buffered.size() < length) {
+			if (!fill()) { return r; }
+		}
+		r.body = buffered.substr(0, length);
+		buffered.erase(0, length);
+		r.whole = true;
+		return r;
+	}
+};
+
+std::string slurp(const std::filesystem::path& p) {
+	std::ifstream in(p);
+	return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+template <typename F>
+bool eventually(std::chrono::milliseconds bound, F f) {
+	for (auto until = clock_type::now() + bound; clock_type::now() < until; std::this_thread::sleep_for(10ms)) {
+		if (f()) { return true; }
+	}
+	return f();
+}
+
+void daemon_test() {
+	const auto dir = scratch / "daemon";
+	const auto port = std::to_string(free_port());
+	const std::vector<std::string> args{"--daemonize", "--runtime-dir", dir.string(), "--port", port, "--reactors", "2", "--no-color"};
+	CHECK(exit_status(spawn(args)) == 0);
+
+	// Serving before the parent returned: the first connect is answered.
+	int fd = connect_to(static_cast<unsigned short>(std::stoi(port)));
+	CHECK(fd >= 0);
+	if (fd >= 0) {
+		CHECK(send_all(fd, request("GET", "/hello")));
+		Reader reader{fd};
+		auto r = reader.read();
+		CHECK(r.whole && r.status == 200 && r.body == "hello from prism\n");
+		::close(fd);
+	}
+
+	const auto pidfile = dir / ("prism-" + port + ".pid");
+	const auto pid = task::locked_pid(pidfile);
+	CHECK(pid.has_value());
+	if (!pid) { return; }
+
+	// A second instance finds the lock held and leaves the first serving.
+	CHECK(exit_status(spawn(args)) == 0);
+	CHECK(task::locked_pid(pidfile) == pid);
+	CHECK(::kill(*pid, 0) == 0);
+
+	CHECK(::kill(*pid, SIGTERM) == 0);
+	CHECK(eventually(10s, [&] { return !task::locked_pid(pidfile); }));
+	const auto log = slurp(dir / ("prism-" + port + ".log"));
+	CHECK(log.find("already running") != std::string::npos);
+	CHECK(log.find("stopped") != std::string::npos);
+	if (failures) { std::fprintf(stderr, "daemon log:\n%s\n", log.c_str()); }
+}
+
+void load_test() {
+	const auto dir = scratch / "load";
+	const unsigned short port = free_port();
+	const auto bound = 10s;
+	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "2",
+		"--shutdown-timeout-ms", std::to_string(std::chrono::milliseconds(bound).count()), "-q"});
+	int probe = -1;
+	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
+	if (probe < 0) { ::kill(child, SIGKILL); exit_status(child); return; }
+	::close(probe);
+
+	// Hammering clients: keep-alive requests until the stop; a response that starts must end.
+	std::atomic<bool> done{false};
+	std::atomic<int> whole{0}, cut{0};
+	std::vector<std::thread> hammers;
+	for (int t = 0; t < 4; ++t) {
+		hammers.emplace_back([&, t] {
+			const std::string req = t % 2 ? request("GET", "/hello") : request("POST", "/echo", std::string(2048, 'x'));
+			while (!done.load()) {
+				int fd = connect_to(port);
+				if (fd < 0) { std::this_thread::sleep_for(1ms); continue; }
+				Reader reader{fd};
+				while (!done.load() && send_all(fd, req)) {
+					auto r = reader.read();
+					if (r.whole && r.status == 200) { ++whole; continue; }
+					if (r.started) { ++cut; }
+					break;
+				}
+				::close(fd);
+			}
+		});
+	}
+	std::this_thread::sleep_for(300ms);
+
+	// The slow reader: a 4 MiB echo read 64 KiB per 10 ms, so the stop lands mid-response.
+	std::string body(4u << 20, '\0');
+	std::mt19937_64 random(42);
+	for (auto& c : body) { c = static_cast<char>(random()); }
+	int fd = connect_to(port, 16 * 1024);
+	CHECK(fd >= 0);
+	clock_type::time_point signalled{};
+	Response slow;
+	if (fd >= 0) {
+		CHECK(send_all(fd, request("POST", "/echo", body)));
+		Reader reader{fd};
+		reader.pace = 10ms;
+		reader.on_head = [&] {
+			signalled = clock_type::now();
+			CHECK(::kill(child, SIGTERM) == 0);
+		};
+		slow = reader.read();
+		::close(fd);
+	}
+	CHECK(slow.whole && slow.status == 200);
+	CHECK(slow.body.size() > body.size() && slow.body.compare(slow.body.size() - body.size() - 1, body.size(), body) == 0);
+
+	const int status = exit_status(child);
+	const auto took = clock_type::now() - signalled;
+	done = true;
+	for (auto& h : hammers) { h.join(); }
+	CHECK(status == 0);
+	CHECK(took < bound);
+	CHECK(whole.load() > 0);
+	CHECK(cut.load() == 0);
+	std::fprintf(stderr, "load: %d whole responses, %d cut; exit %d %lld ms after SIGTERM\n", whole.load(), cut.load(), status,
+		static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+	if (argc != 2) {
+		std::fprintf(stderr, "usage: prism_lifecycle_test PRISM\n");
+		return 2;
+	}
+	prism = argv[1];
+	std::signal(SIGPIPE, SIG_IGN);
+	std::string tmpl = (std::filesystem::current_path() / "prism_lifecycle.XXXXXX").string();
+	if (!::mkdtemp(tmpl.data())) {
+		std::perror("mkdtemp");
+		return 2;
+	}
+	scratch = tmpl;
+	daemon_test();
+	load_test();
+	std::error_code ec;
+	if (!failures) { std::filesystem::remove_all(scratch, ec); }
+	std::fprintf(stderr, failures ? "FAILED: %d checks\n" : "passed\n", failures);
+	return failures ? 1 : 0;
+}

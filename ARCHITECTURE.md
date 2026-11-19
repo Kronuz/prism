@@ -59,3 +59,56 @@ negotiation, compression, and error handling come along unchanged. The framework
 pieces here (the splash, the access-logging middleware, the lifecycle in `main`) are
 the natural next things to lift into their own libraries so the glue shrinks to just
 your views.
+
+## How `main` is put together
+
+`main` follows the composition every Kronuz daemon shares (cpp-libraries
+[docs/server-composition.md](https://github.com/Kronuz/cpp-libraries/blob/04a75c0/docs/server-composition.md),
+Detent D122), step by step. This is Prism's row of the note's Mains table, with the code
+in `src/main.cc`:
+
+| Step | Prism |
+| :---- | :---- |
+| Options | `parse()`: `--config FILE` reads `prism.json`, one object whose keys are the options; flags override it. One name per option, `--max-clients` and `max_clients`, durations in `_ms`. A bad value exits `EX_USAGE`, an unreadable file or certificate `EX_CONFIG`. No `--upstream-ca`: Prism dials nothing |
+| Process | `task::run_daemon(--daemonize, RUNTIME_DIR/prism-PORT.log, serve)`; inside it `task::ProcessLock(RUNTIME_DIR/prism-PORT.pid)`, then the log. A second instance finds the lock held and exits 0 |
+| Signals | `task::stop_signals`, the first thread after the fork: SIGINT or SIGTERM stops, a second hurries, a third flushes and dies. SIGPIPE is ignored |
+| Limits and descriptors | `max_in_flight` and `max_clients` go to the `HttpAsioService` constructor, one connection bound for plain and TLS; `idle_timeout_ms` and the grace by setter. No descriptor check |
+| TLS and privileges | `reactor::tls::configure` with the Server role, then `http::tls_connection_factory(context, 5 s, 64, max_clients)`. No privilege drop |
+| Loop and components | An `asio_scheduler` on the main thread runs the lifecycle; the components are one, `Http` (start binds and serves, drain runs http's stop). `DemoApp` and `AccessLog` are handlers with no lifecycle |
+| `lifecycle`, ready | `task::lifecycle(loop, signals, {shutdown_timeout_ms, 5 s}, ready, http)`; `ready` reports to the waiting parent when detached, then prints the banner and one line |
+| Housekeeping | None, and nothing polls: the loop waits on the lifecycle |
+| Stop | The lifecycle: every `stop()`, then `Http`'s drain, then the flushes; `EX_TEMPFAIL` when a drain leaves work, 1 on a failure after ready |
+
+The options and their defaults:
+
+| Flag, key | Default |
+| :---- | :---- |
+| `--port`, `port` | 8880 (0 binds a free port) |
+| `--bind-address`, `bind_address` | every interface |
+| `--reactors`, `reactors` | hardware threads |
+| `--max-clients`, `max_clients` | 1024 |
+| `--max-in-flight`, `max_in_flight` | 1024 per reactor; 0 is no cap |
+| `--idle-timeout-ms`, `idle_timeout_ms` | 75000; 0 is off |
+| `--shutdown-timeout-ms`, `shutdown_timeout_ms` | 35000 |
+| `--tls-cert`, `--tls-key`, `tls_cert`, `tls_key` | unset: plain HTTP. The key is the private file, named by path |
+| `--daemonize`, `daemonize` | foreground |
+| `--runtime-dir`, `runtime_dir` | `$XDG_RUNTIME_DIR/prism`, else `$TMPDIR/prism-UID` |
+| `-q`, `-v`..., `--verbosity`, `verbosity` | requests at NOTICE |
+| `--color`, `--no-color`, `color`; `--no-tracebacks`, `tracebacks` | auto; tracebacks on |
+
+Where Prism's code path still differs from the note, and why:
+
+| Deviation | Reason | Status |
+| :---- | :---- | :---- |
+| Bounds set by the constructor and setters, not one `http::Limits` | http has no `Limits` yet (Xapiand quest http-limits) | Goes with http-limits |
+| No descriptor check | reactor has no `raise_open_files` yet (Xapiand quest reactor-server-composition); the reserve will be 64 | Goes with reactor-server-composition |
+| `configure` instead of `tls::server_context`, so a group-readable key, an expired certificate and `strict` are not checked | reactor has no `server_context` yet (reactor-server-composition) | Goes with reactor-server-composition |
+| `Http::stop()` closes nothing, and the drain runs http's stop, which cancels the requests in flight at once (their responses are still written) and blocks the loop for the grace | http has no `stop_accepting()` and reactor no stop phases yet; the grace is the smaller of 5 s and the bound, so the bound holds | Goes with http-limits |
+| The configuration file only by `--config`, with no default directory | Prism installs nowhere, so it has no configuration directory | Stays |
+| No privilege drop | Prism has no `--uid` or `--gid` | Stays |
+| TLS compiled out | OpenSSL 3 is optional | Stays: a build option |
+
+`src/test/lifecycle_test.cc` (`ctest`, test `prism_lifecycle`) runs the built binary: detached,
+it serves before the parent returns, holds the pid lock against a second instance and releases it
+at SIGTERM; in the foreground under load, a response being written at SIGTERM arrives whole, no
+response is cut, and prism exits 0 within the shutdown bound.

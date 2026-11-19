@@ -9,7 +9,8 @@
 // color run on Kronuz/logger + term-color (the same stack Xapiand uses); the
 // traceback plugs into the logger's backtrace hook.
 //
-//   ./prism 8880 -vv
+//   ./prism --port 8880 -vv
+//   ./prism --config prism.json --daemonize     # detaches once serving
 //   curl -s localhost:8880/                       # welcome, route list
 //   curl -s localhost:8880/hello -H 'Accept: application/json'
 //   curl -s --compressed localhost:8880/hello     # gzip/zstd negotiated
@@ -21,25 +22,38 @@
 // extract into their own libs; see framework-plan / README.
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <ctime>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
-#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
+#include <vector>
+#include <sysexits.h>
 #include <unistd.h>
+
+#include <asio/io_context.hpp>
+#include <rapidjson/document.h>
 
 #include "http_handler.h"
 #include "http_router.h"
 #include "http_asio.h"
 #include "traceback.h"
+#include "lifecycle.hh"     // task: components, stop_signals, lifecycle
+#include "process.hh"       // task: run_daemon, ProcessLock
+#include "task_asio.hh"     // task: asio_scheduler, the control loop
 #ifdef PRISM_TLS
 #include "http_asio_tls.h"  // http: the TLS connection factory
 #include "reactor_tls.h"    // reactor: TLS contexts (the Server role)
@@ -183,7 +197,7 @@ class DemoApp : public http::HttpHandler {
 	http::Router router_;
 public:
 	DemoApp() {
-		router_.route("GET", "/", [](http::Request&, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
+		router_.route("GET", "/", [](http::Request&, http::ResponseWriter& resp, const http::Params&) -> task::task<void> {
 			resp.send(200,
 				"prism -- a flashy HTTP application server\n\n"
 				"  GET  /        this page\n"
@@ -194,7 +208,7 @@ public:
 				"  GET  /boom    raises an error -> 500 + traceback in the log\n");
 			co_return;
 		});
-		router_.route("GET", "/hello", [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
+		router_.route("GET", "/hello", [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> task::task<void> {
 			auto accept = req.header("Accept");
 			if (accept.find("application/json") != std::string_view::npos)
 				resp.send(200, "{\"hello\":\"world\",\"from\":\"prism\"}\n", "application/json");
@@ -204,7 +218,7 @@ public:
 				resp.send(200, "hello from prism\n");
 			co_return;
 		});
-		auto echo = [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
+		auto echo = [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> task::task<void> {
 			std::string out = req.method + " " + req.path + "\n";
 			for (auto& [k, v] : req.headers) { out += k; out += ": "; out += v; out += "\n"; }
 			if (!req.body.empty()) { out += "\n"; out += req.body; out += "\n"; }
@@ -214,64 +228,183 @@ public:
 		router_.route("GET", "/echo", echo);
 		router_.route("POST", "/echo", echo);
 		router_.route("PUT", "/echo", echo);
-		auto json_echo = [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
+		auto json_echo = [](http::Request& req, http::ResponseWriter& resp, const http::Params&) -> task::task<void> {
 			std::string body = req.body.empty() ? "{\"posted\":null,\"from\":\"prism\"}" : req.body;
 			resp.send(200, body, "application/json");
 			co_return;
 		};
 		router_.route("POST", "/json", json_echo);
 		router_.route("GET", "/json", json_echo);
-		router_.route("GET", "/image", [](http::Request&, http::ResponseWriter& resp, const http::Params&) -> asio::awaitable<void> {
+		router_.route("GET", "/image", [](http::Request&, http::ResponseWriter& resp, const http::Params&) -> task::task<void> {
 			static const std::string png = cppcodec::base64_rfc4648::decode<std::string>(std::string_view(kPrismPngB64));
 			resp.send(200, png, "image/png");
 			co_return;
 		});
-		router_.route("GET", "/boom", [](http::Request&, http::ResponseWriter&, const http::Params&) -> asio::awaitable<void> {
+		router_.route("GET", "/boom", [](http::Request&, http::ResponseWriter&, const http::Params&) -> task::task<void> {
 			throw std::runtime_error("the /boom route always raises");
 			co_return;
 		});
 	}
-	asio::awaitable<void> handle(http::Request& req, http::ResponseWriter& resp) override { co_await router_.handle(req, resp); }
+	task::task<void> handle(http::Request& req, http::ResponseWriter& resp) override { co_await router_.handle(req, resp); }
 };
 
+
 // ---------------------------------------------------------------------------
-static std::atomic<bool> g_stop{false};
-static void on_signal(int) { g_stop.store(true); }
+// The composition (cpp-libraries docs/server-composition.md): options, process,
+// signals, limits, TLS, loop and components, lifecycle. Prism has no housekeeping.
+// ---------------------------------------------------------------------------
+namespace {
 
-int main(int argc, char** argv) {
-	unsigned port = 8880;
-	int log_level = LOG_NOTICE;   // default: request/response lines
-	bool tracebacks = true;
-	std::string color = "auto";
-	std::string tls_cert, tls_key;  // --tls-cert=FILE --tls-key=FILE: serve HTTPS
-	for (int i = 1; i < argc; ++i) {
-		std::string a = argv[i];
-		if (a == "-q") log_level = LOG_WARNING;          // warnings + errors only
-		else if (a.size() >= 2 && a[0] == '-' &&
-		         a.find_first_not_of('v', 1) == std::string::npos) {
-			// -v, -vv, -vvv, -vvvv, ...: count the v's, each raising verbosity one
-			// level above the NOTICE default (requests already show at the default;
-			// -v adds image previews, -vv debug-compiled lines, and so on). Accepting
-			// any run of v's is why `prism -vvvv` is no longer silently ignored.
-			log_level = LOG_NOTICE + static_cast<int>(a.size()) - 1;
-		}
-		else if (a.rfind("--tls-cert=", 0) == 0) tls_cert = a.substr(11);
-		else if (a.rfind("--tls-key=", 0) == 0) tls_key = a.substr(10);
-		else if (a == "--no-tracebacks") tracebacks = false;
-		else if (a == "--no-color") color = "never";
-		else if (a.rfind("--color=", 0) == 0) color = a.substr(8);
-		else if (!a.empty() && a[0] != '-') port = (unsigned)std::atoi(a.c_str());
-	}
+// A bad value exits EX_USAGE; an unreadable configuration or certificate, EX_CONFIG.
+struct usage_error : std::runtime_error { using std::runtime_error::runtime_error; };
+struct config_error : std::runtime_error { using std::runtime_error::runtime_error; };
+
+// Every option has one name, `--max-clients` as a flag and `max_clients` in prism.json.
+struct Options {
+	unsigned short port = 8880;
+	std::string bind_address;  // empty: every interface
 	std::size_t reactors = std::max(1u, std::thread::hardware_concurrency());
+	std::size_t max_clients = 1024;
+	std::size_t max_in_flight = 1024;  // per reactor; 0 = no cap
+	std::chrono::milliseconds idle_timeout{75'000};
+	std::chrono::milliseconds shutdown_timeout{35'000};
+	std::filesystem::path tls_cert, tls_key;  // the key is the private file, named by path
+	std::filesystem::path runtime_dir;
+	bool daemonize = false;
+	int verbosity = 0;  // -1 warnings only, 0 requests (NOTICE), each step one level more
+	std::string color = "auto";
+	bool tracebacks = true;
+};
 
-	// Logging: the Kronuz/logger stack (it brings term-color + scheduler), wired
-	// the way Xapiand wires it -- config from the CLI, a stderr sink, and the
-	// backtrace hook pointed at Kronuz/traceback.
-	Logging::config.log_level = log_level;
+constexpr std::chrono::milliseconds kShutdownGrace{5'000};  // fixed (Settled 3)
+constexpr auto kMaxDuration = std::chrono::milliseconds(std::chrono::hours(24));
+
+const char* kUsage =
+	"usage: prism [--config FILE] [--port N] [--bind-address ADDR] [--reactors N]\n"
+	"             [--max-clients N] [--max-in-flight N] [--idle-timeout-ms MS]\n"
+	"             [--shutdown-timeout-ms MS] [--tls-cert FILE --tls-key FILE]\n"
+	"             [--daemonize] [--runtime-dir DIR] [-q | -v | -vv ... | --verbosity N]\n"
+	"             [--color MODE | --no-color] [--no-tracebacks]\n"
+	"\n"
+	"prism.json (--config) holds the same options as keys: max_clients, idle_timeout_ms, ...;\n"
+	"flags override it, and its relative paths are relative to the file. The TLS key is\n"
+	"the private file. --daemonize detaches once serving, logging to RUNTIME_DIR/prism-PORT.log;\n"
+	"RUNTIME_DIR/prism-PORT.pid is locked while prism runs. SIGINT or SIGTERM stops,\n"
+	"a second one hurries, a third flushes and dies.\n";
+
+std::uint64_t unsigned_value(const std::string& key, const std::string& value, std::uint64_t minimum, std::uint64_t maximum) {
+	std::uint64_t n = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), n);
+	if (value.empty() || error != std::errc{} || end != value.data() + value.size() || n < minimum || n > maximum) {
+		throw usage_error(key + " must be an integer between " + std::to_string(minimum) + " and " + std::to_string(maximum));
+	}
+	return n;
+}
+
+bool bool_value(const std::string& key, const std::string& value) {
+	if (value == "true") { return true; }
+	if (value == "false") { return false; }
+	throw usage_error(key + " must be true or false");
+}
+
+// Applies one option by its key; `base` resolves a relative path (prism.json's directory).
+void set_option(Options& o, const std::string& key, const std::string& value, const std::filesystem::path& base) {
+	auto path = [&] {
+		if (value.empty()) { throw usage_error(key + " must name a file"); }
+		return base.empty() ? std::filesystem::path(value) : (base / value).lexically_normal();
+	};
+	auto ms = [&](std::uint64_t minimum) {
+		return std::chrono::milliseconds(unsigned_value(key, value, minimum, std::uint64_t(kMaxDuration.count())));
+	};
+	if (key == "port") { o.port = static_cast<unsigned short>(unsigned_value(key, value, 0, 65535)); }
+	else if (key == "bind_address") { o.bind_address = value; }
+	else if (key == "reactors") { o.reactors = unsigned_value(key, value, 1, 1024); }
+	else if (key == "max_clients") { o.max_clients = unsigned_value(key, value, 1, 1u << 24); }
+	else if (key == "max_in_flight") { o.max_in_flight = unsigned_value(key, value, 0, 1u << 24); }
+	else if (key == "idle_timeout_ms") { o.idle_timeout = ms(0); }
+	else if (key == "shutdown_timeout_ms") { o.shutdown_timeout = ms(1); }
+	else if (key == "tls_cert") { o.tls_cert = path(); }
+	else if (key == "tls_key") { o.tls_key = path(); }
+	else if (key == "runtime_dir") { o.runtime_dir = path(); }
+	else if (key == "daemonize") { o.daemonize = bool_value(key, value); }
+	else if (key == "verbosity") { o.verbosity = static_cast<int>(unsigned_value(key, value, 0, 8)); }
+	else if (key == "color") { o.color = value; }
+	else if (key == "tracebacks") { o.tracebacks = bool_value(key, value); }
+	else { throw usage_error("unknown option: " + key); }
+}
+
+// prism.json: one object whose keys are the options; a value is a string, a number or a boolean.
+void load_config(Options& o, const std::filesystem::path& file) {
+	std::ifstream in(file, std::ios::binary);
+	if (!in) { throw config_error("cannot read " + file.string()); }
+	const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	rapidjson::Document doc;
+	doc.Parse<rapidjson::kParseIterativeFlag | rapidjson::kParseValidateEncodingFlag>(bytes.data(), bytes.size());
+	if (doc.HasParseError() || !doc.IsObject()) { throw config_error(file.string() + ": expected a JSON object"); }
+	const auto base = std::filesystem::absolute(file).parent_path();
+	for (auto it = doc.MemberBegin(); it != doc.MemberEnd(); ++it) {
+		const std::string key(it->name.GetString(), it->name.GetStringLength());
+		const auto& v = it->value;
+		std::string value;
+		if (v.IsString()) { value.assign(v.GetString(), v.GetStringLength()); }
+		else if (v.IsBool()) { value = v.GetBool() ? "true" : "false"; }
+		else if (v.IsUint64()) { value = std::to_string(v.GetUint64()); }
+		else { throw usage_error(file.string() + ": " + key + " must be a string, a nonnegative integer or a boolean"); }
+		set_option(o, key, value, base);
+	}
+}
+
+Options parse(int argc, char** argv) {
+	std::vector<std::string> args(argv + 1, argv + argc);
+	Options o;
+	for (std::size_t i = 0; i < args.size(); ++i) {  // the file first: flags override it
+		if (args[i] == "--config" || args[i].rfind("--config=", 0) == 0) {
+			if (args[i] == "--config" && i + 1 == args.size()) { throw usage_error("--config requires a file"); }
+			load_config(o, args[i] == "--config" ? args[i + 1] : args[i].substr(9));
+		}
+	}
+	for (std::size_t i = 0; i < args.size(); ++i) {
+		const std::string& a = args[i];
+		if (a == "-q") { o.verbosity = -1; continue; }
+		if (a.size() >= 2 && a[0] == '-' && a[1] == 'v' && a.find_first_not_of('v', 1) == std::string::npos) {
+			o.verbosity = static_cast<int>(a.size()) - 1;  // -v, -vv, ...: one level each above NOTICE
+			continue;
+		}
+		if (a == "--daemonize") { o.daemonize = true; continue; }
+		if (a == "--no-color") { o.color = "never"; continue; }
+		if (a == "--no-tracebacks") { o.tracebacks = false; continue; }
+		if (a.rfind("--", 0) != 0) { throw usage_error("unexpected argument: " + a); }
+		std::string flag = a.substr(2), value;
+		if (auto eq = flag.find('='); eq != std::string::npos) {
+			value = flag.substr(eq + 1);
+			flag.resize(eq);
+		} else {
+			if (i + 1 == args.size()) { throw usage_error(a + " requires a value"); }
+			value = args[++i];
+		}
+		if (flag == "config") { continue; }  // read above
+		std::string key = flag;
+		std::replace(key.begin(), key.end(), '-', '_');
+		set_option(o, key, value, {});
+	}
+	if (o.tls_cert.empty() != o.tls_key.empty()) { throw usage_error("--tls-cert and --tls-key go together"); }
+	if (o.runtime_dir.empty()) {
+		const char* xdg = std::getenv("XDG_RUNTIME_DIR");
+		o.runtime_dir = xdg && *xdg ? std::filesystem::path(xdg) / "prism"
+		                            : std::filesystem::temp_directory_path() / ("prism-" + std::to_string(::geteuid()));
+	}
+	return o;
+}
+
+void configure_logging(const Options& o) {
+	// The Kronuz/logger stack (it brings term-color + scheduler), wired the way Xapiand wires
+	// it: a stderr sink (the log file when detached) and the backtrace hook on Kronuz/traceback.
+	Logging::config.log_level = o.verbosity < 0 ? LOG_WARNING : LOG_NOTICE + o.verbosity;
 	Logging::config.timestamp = LogTimestamp::iso8601;
 	Logging::config.precision = LogPrecision::milliseconds;
 	Logging::config.timestamp_gradient = true;
 	Logging::config.tint = true;  // each message in its severity's color, as Xapiand's
+	const std::string& color = o.color;
 	if (color == "never" || color == "off") {
 		Logging::config.color = LogColorMode::never;
 	} else if (color == "always" || color == "on") {
@@ -285,16 +418,64 @@ int main(int argc, char** argv) {
 	} else if (color == "stacked") {
 		Logging::config.color = LogColorMode::always; Logging::config.color_depth = LogColorDepth::stacked;
 	}  // else "auto": defaults (automatic mode + automatic depth)
-	if (tracebacks) {
+	if (o.tracebacks) {
 		Logging::hooks.backtrace = []() { return traceback::format(""); };
 	}
 	Logging::add_handler(std::make_unique<StderrLogger>());
+}
+
+// The HTTP component: start() binds and serves; drain() runs http's stop, which cancels the
+// requests in flight (their responses are still written), gives them the grace, then forces.
+struct Http {
+	http::HttpAsioService& service;
+	unsigned short port;
+
+	task::task<void> start(task::cancel_token) {
+		service.start(port);
+		co_return;
+	}
+	void stop() {}  // closing only the listeners waits for http's stop_accepting()
+	task::task<std::vector<std::string>> drain(const task::stop_bound&) {
+		service.stop();
+		co_return std::vector<std::string>{};
+	}
+	void flush() {}
+	std::string name() const { return "http"; }
+};
+
+// Everything after the fork: the pid lock, the signals, the log, then the lifecycle.
+int serve(const Options& o, const task::daemon_ready& daemon_ready) {
+	task::ProcessLock lock(o.runtime_dir / ("prism-" + std::to_string(o.port) + ".pid"), false);
+	if (!lock.acquired()) {
+		std::printf("prism: already running on port %u\n", unsigned(o.port));
+		std::fflush(stdout);  // a detached child ends in _exit
+		return 0;
+	}
+	task::stop_signals signals;  // the first thread, so none crosses the fork
+	std::signal(SIGPIPE, SIG_IGN);  // a write to a reset peer fails with EPIPE instead
+	configure_logging(o);
+	struct LogSession { ~LogSession() { Logging::finish(); } } log_session;  // drains the LOG thread last
+
+	http::HttpAsioService::ConnectionFactory connection;
+	if (!o.tls_cert.empty()) {
+#ifdef PRISM_TLS
+		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+		try {
+			reactor::tls::configure(*context, reactor::tls::Options{o.tls_cert.string(), o.tls_key.string(), ""}, reactor::tls::Role::Server);
+		} catch (const std::exception& e) {
+			throw config_error(std::string("TLS: ") + e.what());
+		}
+		connection = http::tls_connection_factory(std::move(context), std::chrono::seconds(5), 64, o.max_clients);
+#else
+		throw config_error("this prism was built without TLS (OpenSSL 3 was not found)");
+#endif
+	}
 
 	DemoApp app;
-	// The request/response logging middleware, with prism's JSON reindenter as the
-	// body prettifier (Xapiand injects a MsgPack/YAML one instead). prism lowers the
-	// levels from the Xapiand-faithful defaults (DEBUG) to NOTICE so the rich blocks
-	// show out of the box (a bare `prism`), with image previews at -v and above.
+	// The request/response logging middleware, with prism's JSON reindenter as the body
+	// prettifier (Xapiand injects a MsgPack/YAML one instead). prism lowers the levels from
+	// the Xapiand-faithful defaults (DEBUG) to NOTICE so the rich blocks show out of the box,
+	// with image previews at -v and above.
 	http_log::Options logopts;
 	logopts.request_level = LOG_NOTICE;
 	logopts.level_2xx = LOG_NOTICE;
@@ -308,44 +489,79 @@ int main(int argc, char** argv) {
 	};
 	http_log::AccessLog access(app, std::move(logopts));
 
-	// HTTPS with a certificate and key alone: reactor's TLS Server role needs no authority.
-	if (tls_cert.empty() != tls_key.empty()) {
-		L_ERR("--tls-cert and --tls-key go together");
-		Logging::finish();
-		return 2;
-	}
-	const bool https = !tls_cert.empty();
-	std::unique_ptr<http::HttpAsioService> listener;
-	if (https) {
-#ifdef PRISM_TLS
-		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
-		reactor::tls::configure(*context, reactor::tls::Options{tls_cert, tls_key, ""}, reactor::tls::Role::Server);
-		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*in_flight_limit=*/256,
-			http::tls_connection_factory_timed(context), /*maximum_connections=*/1024);
-#else
-		L_ERR("this prism was built without TLS (OpenSSL 3 was not found)");
-		Logging::finish();
-		return 2;
-#endif
-	} else {
-		listener = std::make_unique<http::HttpAsioService>(access, reactors, /*in_flight_limit=*/256);
-	}
-	http::HttpAsioService& service = *listener;
+	// One bound for plain and TLS: max_clients connections, max_in_flight requests per reactor.
+	http::HttpAsioService service(access, o.reactors, o.max_in_flight, std::move(connection), o.max_clients);
+	service.set_idle_timeout(o.idle_timeout);
+	service.set_shutdown_grace(std::min(kShutdownGrace, o.shutdown_timeout));
+	http::AsioBindOptions bind;
+	bind.address = o.bind_address;
+	service.set_bind_options(bind);
 	service.enable_compression();
 	service.enable_conditional();
 	service.enable_ranges();
 
-	std::signal(SIGINT, on_signal);
-	std::signal(SIGTERM, on_signal);
+	asio::io_context io(1);
+	task::asio_scheduler loop(io.get_executor());
+	Http http{service, o.port};
+	const bool https = !o.tls_cert.empty();
+	auto ready = [&] {
+		daemon_ready();
+		banner(service.port(), o.reactors, https);
+		L_NOTICE(col::grey() + "ready -- Ctrl-C to stop" + col::reset());
+	};
+	const task::stop_timing timing{o.shutdown_timeout, std::min<std::chrono::nanoseconds>(kShutdownGrace, o.shutdown_timeout)};
+	task::stopped result;
+	task::spawn(task::scheduler_ref::of(loop), task::lifecycle(loop, signals, timing, ready, http),
+		[&](std::exception_ptr e, std::optional<task::stopped> r) {
+			result = r ? std::move(*r) : task::stopped{e};
+			io.stop();
+		});
+	io.run();  // the lifecycle holds the loop's work guard until every flush returned
 
-	service.start(static_cast<unsigned short>(port));
-	banner(port, reactors, https);
-	L_NOTICE(col::grey() + "ready -- Ctrl-C to stop" + col::reset());
-
-	while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-	L_NOTICE(col::grey() + "shutting down..." + col::reset());
-	service.stop();
-	Logging::finish();   // drain the LOG thread before statics tear down
+	if (!result.unfinished.empty()) {
+		for (const auto& line : result.unfinished) { L_WARNING("prism: unfinished: {}", line); }
+		Logging::finish();
+		std::_Exit(EX_TEMPFAIL);
+	}
+	loop.close();
+	loop.destroy_roots();
+	service.destroy_roots();
+	if (result.failure) {
+		if (!result.ready) { std::rethrow_exception(result.failure); }  // reaches the waiting parent
+		try { std::rethrow_exception(result.failure); } catch (const std::exception& e) { L_ERR("prism: {}", e.what()); }
+		return 1;
+	}
+	L_NOTICE(col::grey() + "stopped" + col::reset());
 	return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+	for (int i = 1; i < argc; ++i) {
+		if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") {
+			std::fputs(kUsage, stdout);
+			return 0;
+		}
+	}
+	Options o;
+	try {
+		o = parse(argc, argv);
+	} catch (const usage_error& e) {
+		std::fprintf(stderr, "prism: %s\n%s", e.what(), kUsage);
+		return EX_USAGE;
+	} catch (const config_error& e) {
+		std::fprintf(stderr, "prism: %s\n", e.what());
+		return EX_CONFIG;
+	}
+	const auto log = o.runtime_dir / ("prism-" + std::to_string(o.port) + ".log");
+	try {
+		return task::run_daemon(o.daemonize, log, [&](const task::daemon_ready& ready) { return serve(o, ready); });
+	} catch (const config_error& e) {
+		std::fprintf(stderr, "prism: %s\n", e.what());
+		return EX_CONFIG;
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "prism: %s\n", e.what());
+		return 1;
+	}
 }
