@@ -72,8 +72,8 @@ in `src/main.cc`:
 | Options | `parse()`: `--config FILE` reads `prism.json`, one object whose keys are the options; flags override it. One name per option, `--max-clients` and `max_clients`, durations in `_ms`. A bad value exits `EX_USAGE`, an unreadable file, certificate or key `EX_CONFIG`, checked before the fork so a detached start exits the same. No `--upstream-ca`: Prism dials nothing |
 | Process | `task::run_daemon(--daemonize, RUNTIME_DIR/prism-PORT.log, serve)`; inside it `task::ProcessLock(RUNTIME_DIR/prism-PORT.pid)`, then the log. A second instance finds the lock held and exits 0 |
 | Signals | `task::stop_signals`, the first thread after the fork: SIGINT or SIGTERM stops, a second hurries (it cancels the requests in flight at once) and a third flushes and dies. SIGPIPE is ignored |
-| Limits and descriptors | The options fill one `http::Limits` (`max_clients`, `max_in_flight`, `idle_timeout`, `shutdown_grace`; the rest are http's defaults) that the `HttpAsioService` constructor takes whole, plain and TLS alike. `reactor::raise_open_files(max_clients + 64)` runs before any component: short of it an explicit `max_clients` exits `EX_CONFIG` and the default shrinks to fit, with a warning |
-| TLS and privileges | `reactor::tls::server_context`, which refuses a key readable by group or others and a certificate not yet valid or expired and sets `strict`; a failure exits `EX_CONFIG`, and a certificate within 14 days of expiry is warned about. The context goes to the service as `http::Tls`. No privilege drop |
+| Limits and descriptors | The options fill one `http::Limits` (`max_clients`, `max_in_flight`, `idle_timeout`, `shutdown_grace`; the rest are http's defaults) that the `HttpAsioService` constructor takes whole, plain and TLS alike. `reactor::raise_open_files(max_clients + 64)` runs before the fork, so a refusal exits `EX_CONFIG` detached too: short of it an explicit `max_clients` exits `EX_CONFIG` and the default shrinks to fit, with a warning |
+| TLS and privileges | `reactor::tls::server_context`, which refuses a key readable by group or others and a certificate not yet valid or expired and sets `strict`; a failure exits `EX_CONFIG`, before the fork too, and a certificate within 14 days of expiry is warned about. The context goes to the service as `http::Tls`. No privilege drop |
 | Loop and components | An `asio_scheduler` on the main thread runs the lifecycle; the components are one, `Http` (start binds and serves, stop closes the listeners with `stop_accepting()`, drain waits for the requests in flight, then cancels the rest and runs http's stop). `DemoApp` and `AccessLog` are handlers with no lifecycle |
 | `lifecycle`, ready | `task::lifecycle(loop, signals, {shutdown_timeout_ms, 5 s}, ready, http)`; `ready` reports to the waiting parent when detached, then prints the banner and one line |
 | Housekeeping | None, and nothing polls: the loop waits on the lifecycle |
@@ -112,5 +112,6 @@ response is cut (a request after the stop is refused with a whole 503), and pris
 shutdown bound; a request whose body is still arriving at SIGTERM finishes and is answered whole
 while new connections are refused, and a second SIGTERM cancels it; a stalled peer is cut at the
 bound. The same test runs prism under a descriptor limit (an explicit `max_clients` that does not
-fit exits `EX_CONFIG`, the default shrinks) and, with OpenSSL, refuses a group-readable key and
-serves HTTPS with an owner-only one.
+fit exits `EX_CONFIG`, detached too; the default shrinks) and, with OpenSSL, refuses a
+group-readable key the same way and serves HTTPS with an owner-only one. Every instance starts on
+`--port 0` and the test reads the bound port from the banner in its log.

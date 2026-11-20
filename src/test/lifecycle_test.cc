@@ -60,22 +60,6 @@ int failures = 0;
 std::string prism;
 std::filesystem::path scratch;
 
-// A port below the ephemeral range, each used once: a client port left in TIME_WAIT by the load
-// test, or one another process holds, would refuse a bind on a port taken from the ephemeral range.
-unsigned short free_port() {
-	static unsigned short next = static_cast<unsigned short>(20000 + ::getpid() % 20000);
-	for (;; ++next) {
-		int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-		sockaddr_in a{};
-		a.sin_family = AF_INET;
-		a.sin_port = htons(next);
-		a.sin_addr.s_addr = htonl(INADDR_ANY);
-		const bool free = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
-		::close(fd);
-		if (free) { return next++; }
-	}
-}
-
 pid_t spawn(std::vector<std::string> args, std::size_t open_files = 0, const std::string& stderr_to = {}) {
 	args.insert(args.begin(), prism);
 	pid_t pid = ::fork();
@@ -197,14 +181,46 @@ bool eventually(std::chrono::milliseconds bound, F f) {
 	return f();
 }
 
+// The port a prism logged in its banner ("listening http://127.0.0.1:PORT"), or 0 before it did.
+unsigned short banner_port(const std::filesystem::path& log) {
+	const auto text = slurp(log);
+	const auto at = text.find("127.0.0.1:");
+	return at == std::string::npos ? 0 : static_cast<unsigned short>(std::strtoul(text.c_str() + at + 10, nullptr, 10));
+}
+
+// A prism on `--port 0`, its log (stderr) in `dir`, started once the banner names the port it
+// bound: no port is chosen here, so none can be taken. `port` is 0 when it never came up.
+struct Server {
+	pid_t pid = -1;
+	unsigned short port = 0;
+	std::filesystem::path log;
+};
+
+Server start(const std::filesystem::path& dir, std::vector<std::string> args, std::size_t open_files = 0) {
+	static int started = 0;
+	std::filesystem::create_directories(dir);
+	Server server;
+	server.log = dir / ("server-" + std::to_string(++started) + ".log");
+	for (const char* a : {"--runtime-dir", "", "--port", "0", "--no-color"}) { args.push_back(*a ? a : dir.string()); }
+	server.pid = spawn(args, open_files, server.log.string());
+	if (!eventually(10s, [&] { return (server.port = banner_port(server.log)) != 0; })) {
+		::kill(server.pid, SIGKILL);
+		exit_status(server.pid);
+		std::fprintf(stderr, "prism did not come up; its log:\n%s\n", slurp(server.log).c_str());
+		++failures;
+	}
+	return server;
+}
+
 void daemon_test() {
 	const auto dir = scratch / "daemon";
-	const auto port = std::to_string(free_port());
-	const std::vector<std::string> args{"--daemonize", "--runtime-dir", dir.string(), "--port", port, "--reactors", "2", "--no-color"};
+	const std::vector<std::string> args{"--daemonize", "--runtime-dir", dir.string(), "--port", "0", "--reactors", "2", "--no-color"};
 	CHECK(exit_status(spawn(args)) == 0);
 
-	// Serving before the parent returned: the first connect is answered.
-	int fd = connect_to(static_cast<unsigned short>(std::stoi(port)));
+	// Serving before the parent returned: the banner is in the log, and the first connect is answered.
+	unsigned short port = 0;  // the banner follows the parent's return by a log flush
+	CHECK(eventually(10s, [&] { return (port = banner_port(dir / "prism-0.log")) != 0; }));
+	int fd = port ? connect_to(port) : -1;
 	CHECK(fd >= 0);
 	if (fd >= 0) {
 		CHECK(send_all(fd, request("GET", "/hello")));
@@ -214,7 +230,7 @@ void daemon_test() {
 		::close(fd);
 	}
 
-	const auto pidfile = dir / ("prism-" + port + ".pid");
+	const auto pidfile = dir / "prism-0.pid";
 	const auto pid = task::locked_pid(pidfile);
 	CHECK(pid.has_value());
 	if (!pid) { return; }
@@ -226,7 +242,7 @@ void daemon_test() {
 
 	CHECK(::kill(*pid, SIGTERM) == 0);
 	CHECK(eventually(10s, [&] { return !task::locked_pid(pidfile); }));
-	const auto log = slurp(dir / ("prism-" + port + ".log"));
+	const auto log = slurp(dir / "prism-0.log");
 	CHECK(log.find("already running") != std::string::npos);
 	CHECK(log.find("stopped") != std::string::npos);
 	if (failures) { std::fprintf(stderr, "daemon log:\n%s\n", log.c_str()); }
@@ -234,14 +250,11 @@ void daemon_test() {
 
 void load_test() {
 	const auto dir = scratch / "load";
-	const unsigned short port = free_port();
 	const auto bound = 10s;
-	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "2",
-		"--shutdown-timeout-ms", std::to_string(std::chrono::milliseconds(bound).count()), "-q"});
-	int probe = -1;
-	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
-	if (probe < 0) { ::kill(child, SIGKILL); exit_status(child); return; }
-	::close(probe);
+	const Server server_child = start(dir, {"--reactors", "2", "--shutdown-timeout-ms", std::to_string(std::chrono::milliseconds(bound).count())});
+	const pid_t child = server_child.pid;
+	const unsigned short port = server_child.port;
+	if (!port) { return; }
 
 	// Hammering clients: keep-alive requests until the stop; a response that starts must end.
 	std::atomic<bool> done{false};
@@ -313,14 +326,11 @@ std::optional<int> exit_within(pid_t pid, std::chrono::milliseconds bound) {
 
 void stalled_test() {
 	const auto dir = scratch / "stalled";
-	const unsigned short port = free_port();
 	const auto bound = 2s;
-	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "1",
-		"--shutdown-timeout-ms", std::to_string(std::chrono::milliseconds(bound).count()), "-q"});
-	int probe = -1;
-	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
-	if (probe < 0) { ::kill(child, SIGKILL); exit_status(child); return; }
-	::close(probe);
+	const Server server_child = start(dir, {"--reactors", "1", "--shutdown-timeout-ms", std::to_string(std::chrono::milliseconds(bound).count())});
+	const pid_t child = server_child.pid;
+	const unsigned short port = server_child.port;
+	if (!port) { return; }
 
 	// A peer that reads the response's first bytes, then nothing: the write stalls on it.
 	std::string body(4u << 20, 'x');
@@ -346,13 +356,10 @@ void stalled_test() {
 // waits for it. A second signal then cancels the request still waiting.
 void drain_test() {
 	const auto dir = scratch / "drain";
-	const unsigned short port = free_port();
-	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "2",
-		"--shutdown-timeout-ms", "20000", "-q"});
-	int probe = -1;
-	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
-	if (probe < 0) { ::kill(child, SIGKILL); exit_status(child); return; }
-	::close(probe);
+	const Server server_child = start(dir, {"--reactors", "2", "--shutdown-timeout-ms", "20000"});
+	const pid_t child = server_child.pid;
+	const unsigned short port = server_child.port;
+	if (!port) { return; }
 
 	const std::string body(1000, 'b');
 	const std::string head = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
@@ -382,12 +389,10 @@ void drain_test() {
 	CHECK(status == 0);
 
 	// A second SIGTERM hurries: the request still being received is cancelled at once.
-	const unsigned short port2 = free_port();
-	const auto child2 = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port2), "--reactors", "2",
-		"--shutdown-timeout-ms", "20000", "-q"});
-	CHECK(eventually(10s, [&] { return (probe = connect_to(port2)) >= 0; }));
-	if (probe < 0) { ::kill(child2, SIGKILL); exit_status(child2); return; }
-	::close(probe);
+	const Server server_child2 = start(dir / "hurry", {"--reactors", "2", "--shutdown-timeout-ms", "20000"});
+	const pid_t child2 = server_child2.pid;
+	const unsigned short port2 = server_child2.port;
+	if (!port2) { return; }
 	int stuck = connect_to(port2);
 	CHECK(stuck >= 0 && send_all(stuck, head + body.substr(0, 400)));
 	std::this_thread::sleep_for(200ms);
@@ -405,31 +410,36 @@ void drain_test() {
 		status2.value_or(-1), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
 }
 
-// A descriptor limit of 200 holds 136 connections with the reserve of 64.
+// A descriptor limit of 200 holds 136 connections with the reserve of 64. A refusal exits EX_CONFIG
+// in the foreground and detached alike.
 void limits_test() {
 	const auto dir = scratch / "limits";
 	std::filesystem::create_directories(dir);
-	const unsigned short refused_port = free_port();
-	const auto refused_log = (dir / "refused.err").string();
-	const auto refused = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(refused_port), "--max-clients", "1024"}, 200, refused_log);
-	CHECK(exit_status(refused) == EX_CONFIG);
-	CHECK(slurp(refused_log).find("max_clients 1024 needs 1088 descriptors") != std::string::npos);
+	for (const char* detach : {"", "--daemonize"}) {
+		const auto log = (dir / (std::string("refused") + (*detach ? "-detached" : "") + ".err")).string();
+		std::vector<std::string> args{"--runtime-dir", dir.string(), "--port", "0", "--max-clients", "1024"};
+		if (*detach) { args.push_back(detach); }
+		CHECK(exit_status(spawn(args, 200, log)) == EX_CONFIG);
+		CHECK(slurp(log).find("max_clients 1024 needs 1088 descriptors") != std::string::npos);
+	}
 
-	const unsigned short port = free_port();
-	const auto fitted_log = (dir / "fitted.err").string();
-	const auto fitted = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "1", "--no-color"}, 200, fitted_log);
-	int probe = -1;
-	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
-	if (probe >= 0) {
-		CHECK(send_all(probe, request("GET", "/hello")));
-		Reader reader{probe};
+	const Server server_fitted = start(dir / "fitted", {"--reactors", "1"}, 200);
+	const pid_t fitted = server_fitted.pid;
+	const unsigned short port = server_fitted.port;
+	const std::filesystem::path& log = server_fitted.log;
+	if (!port) { return; }
+	int fd = connect_to(port);
+	CHECK(fd >= 0);
+	if (fd >= 0) {
+		CHECK(send_all(fd, request("GET", "/hello")));
+		Reader reader{fd};
 		auto r = reader.read();
 		CHECK(r.whole && r.status == 200);
-		::close(probe);
+		::close(fd);
 	}
 	::kill(fitted, SIGTERM);
 	CHECK(exit_within(fitted, 10s) == 0);
-	CHECK(slurp(fitted_log).find("max_clients is 136") != std::string::npos);
+	CHECK(slurp(log).find("max_clients is 136") != std::string::npos);
 }
 
 #ifdef PRISM_TLS
@@ -447,22 +457,28 @@ void tls_test() {
 		" -out " + cert.string() + " >/dev/null 2>&1";
 	if (std::system(make.c_str()) != 0) { std::fprintf(stderr, "tls: skipped (openssl could not make a certificate)\n"); return; }
 
+	// A key readable by group is refused with EX_CONFIG, foreground and detached.
 	::chmod(key.c_str(), 0644);
-	const auto err = (dir / "group.err").string();
-	const auto refused = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(free_port()), "--tls-cert", cert.string(),
-		"--tls-key", key.string()}, 0, err);
-	CHECK(exit_status(refused) == EX_CONFIG);
-	CHECK(slurp(err).find("readable by group or others") != std::string::npos);
+	for (const char* detach : {"", "--daemonize"}) {
+		const auto err = (dir / (std::string("group") + (*detach ? "-detached" : "") + ".err")).string();
+		std::vector<std::string> args{"--runtime-dir", dir.string(), "--port", "0", "--tls-cert", cert.string(), "--tls-key", key.string()};
+		if (*detach) { args.push_back(detach); }
+		CHECK(exit_status(spawn(args, 0, err)) == EX_CONFIG);
+		CHECK(slurp(err).find("readable by group or others") != std::string::npos);
+	}
 
 	::chmod(key.c_str(), 0600);
-	const unsigned short port = free_port();
-	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "1", "--tls-cert", cert.string(),
-		"--tls-key", key.string(), "-q"});
+	const Server server_child = start(dir / "serving", {"--reactors", "1", "--tls-cert", cert.string(), "--tls-key", key.string()});
+	const pid_t child = server_child.pid;
+	const unsigned short port = server_child.port;
+	const std::filesystem::path& log = server_child.log;
+	if (!port) { return; }
 	const std::string get = "curl -sk --max-time 5 https://127.0.0.1:" + std::to_string(port) + "/hello > " + (dir / "hello.out").string();
-	CHECK(eventually(10s, [&] { return std::system(get.c_str()) == 0; }));
+	CHECK(std::system(get.c_str()) == 0);
 	CHECK(slurp(dir / "hello.out") == "hello from prism\n");
 	::kill(child, SIGTERM);
 	CHECK(exit_within(child, 10s) == 0);
+	CHECK(slurp(log).find("expires within 14 days") != std::string::npos);  // the 2-day certificate
 }
 #endif
 

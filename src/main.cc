@@ -461,9 +461,17 @@ struct Http {
 	std::string name() const { return "http"; }
 };
 
+// What the checks before the fork settle: the TLS context and the warnings to log once the log is
+// open. Run before the fork so a refusal exits EX_CONFIG detached too; no thread exists yet, and the
+// raised descriptor limit and the context are inherited.
+struct Prepared {
+	http::Tls tls;
+	std::vector<std::string> warnings;
+};
+
 // The descriptor step: one per connection plus the reserve. Raises the soft limit toward the hard
 // one; short of the budget, an explicit max_clients is refused and the default shrinks to fit.
-void check_descriptors(Options& o) {
+void check_descriptors(Options& o, Prepared& prepared) {
 	const std::size_t wanted = o.max_clients + kDescriptorReserve;
 	const std::size_t have = reactor::raise_open_files(wanted);
 	if (have >= wanted) { return; }
@@ -475,31 +483,29 @@ void check_descriptors(Options& o) {
 		throw config_error("the descriptor limit " + std::to_string(have) + " leaves no room for connections");
 	}
 	o.max_clients = have - kDescriptorReserve;
-	L_WARNING("prism: descriptor limit {}: max_clients is {}", have, o.max_clients);
+	prepared.warnings.push_back("descriptor limit " + std::to_string(have) + ": max_clients is " + std::to_string(o.max_clients));
 }
 
 // The TLS the service presents: reactor's server context (key mode, validity and strict checked),
 // none for plain HTTP.
-http::Tls make_tls(const Options& o) {
-	http::Tls tls;
-	if (o.tls_cert.empty()) { return tls; }
+void make_tls(const Options& o, Prepared& prepared) {
+	if (o.tls_cert.empty()) { return; }
 #ifdef PRISM_TLS
 	try {
-		tls.context = reactor::tls::server_context(reactor::tls::Options{o.tls_cert.string(), o.tls_key.string(), ""});
+		prepared.tls.context = reactor::tls::server_context(reactor::tls::Options{o.tls_cert.string(), o.tls_key.string(), ""});
 	} catch (const std::exception& e) {
 		throw config_error(std::string("TLS: ") + e.what());
 	}
-	if (reactor::tls::seconds_to_expiry(*tls.context) < reactor::tls::expiry_warning.count()) {
-		L_WARNING("prism: the TLS certificate {} expires within 14 days", o.tls_cert.string());
+	if (reactor::tls::seconds_to_expiry(*prepared.tls.context) < reactor::tls::expiry_warning.count()) {
+		prepared.warnings.push_back("the TLS certificate " + o.tls_cert.string() + " expires within 14 days");
 	}
-	return tls;
 #else
 	throw config_error("this prism was built without TLS (OpenSSL 3 was not found)");
 #endif
 }
 
 // Everything after the fork: the pid lock, the signals, the log, then the lifecycle.
-int serve(Options o, const task::daemon_ready& daemon_ready) {
+int serve(const Options& o, Prepared prepared, const task::daemon_ready& daemon_ready) {
 	task::ProcessLock lock(o.runtime_dir / ("prism-" + std::to_string(o.port) + ".pid"), false);
 	if (!lock.acquired()) {
 		std::printf("prism: already running on port %u\n", unsigned(o.port));
@@ -511,8 +517,7 @@ int serve(Options o, const task::daemon_ready& daemon_ready) {
 	configure_logging(o);
 	struct LogSession { ~LogSession() { Logging::finish(); } } log_session;  // drains the LOG thread last
 
-	check_descriptors(o);
-	[[maybe_unused]] auto tls = make_tls(o);
+	for (const auto& warning : prepared.warnings) { L_WARNING("prism: {}", warning); }
 
 	DemoApp app;
 	// The request/response logging middleware, with prism's JSON reindenter as the body
@@ -540,7 +545,7 @@ int serve(Options o, const task::daemon_ready& daemon_ready) {
 		.shutdown_grace = std::min(kShutdownGrace, o.shutdown_timeout),
 	};
 #ifdef PRISM_TLS
-	http::HttpAsioService service(access, o.reactors, limits, std::move(tls));
+	http::HttpAsioService service(access, o.reactors, limits, std::move(prepared.tls));
 #else
 	http::HttpAsioService service(access, o.reactors, limits);
 #endif
@@ -612,8 +617,11 @@ int main(int argc, char** argv) {
 			return EX_CONFIG;
 		}
 	}
+	Prepared prepared;
 	try {
-		return task::run_daemon(o.daemonize, log, [&](const task::daemon_ready& ready) { return serve(o, ready); });
+		check_descriptors(o, prepared);
+		make_tls(o, prepared);
+		return task::run_daemon(o.daemonize, log, [&](const task::daemon_ready& ready) { return serve(o, std::move(prepared), ready); });
 	} catch (const config_error& e) {
 		std::fprintf(stderr, "prism: %s\n", e.what());
 		return EX_CONFIG;
