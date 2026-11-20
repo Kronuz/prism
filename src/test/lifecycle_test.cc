@@ -60,16 +60,20 @@ int failures = 0;
 std::string prism;
 std::filesystem::path scratch;
 
+// A port below the ephemeral range, each used once: a client port left in TIME_WAIT by the load
+// test, or one another process holds, would refuse a bind on a port taken from the ephemeral range.
 unsigned short free_port() {
-	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-	sockaddr_in a{};
-	a.sin_family = AF_INET;
-	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-	socklen_t n = sizeof(a);
-	::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &n);
-	::close(fd);
-	return ntohs(a.sin_port);
+	static unsigned short next = static_cast<unsigned short>(20000 + ::getpid() % 20000);
+	for (;; ++next) {
+		int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_port = htons(next);
+		a.sin_addr.s_addr = htonl(INADDR_ANY);
+		const bool free = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+		::close(fd);
+		if (free) { return next++; }
+	}
 }
 
 pid_t spawn(std::vector<std::string> args, std::size_t open_files = 0, const std::string& stderr_to = {}) {
