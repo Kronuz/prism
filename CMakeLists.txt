@@ -18,16 +18,20 @@ include(FetchContent)
 # (run_daemon, ProcessLock). Declared before http so reactor and http build against this pin.
 FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 0316befffa225849f04a8064ea6c46a334e52b94)
 
+# reactor: raise_open_files, tls::server_context and the bounded TLS parse cache (6cd8f73), newer
+# than the pin http carries; declared before http, so this one holds.
+FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG 6cd8f73145efaf8d77937131a2825799e396c82c)
+
 # RapidJSON reads prism.json. Headers only: its own build stays off.
 FetchContent_Declare(rapidjson GIT_REPOSITORY https://github.com/Tencent/rapidjson.git GIT_TAG 24b5e7a8b27f42fa16b96fc70aade9106cf7102f
   SOURCE_SUBDIR do-not-configure)
 FetchContent_MakeAvailable(rapidjson)
 
 # The HTTP/1.1 application framework on standalone Asio (C++20 coroutines). It
-# transitively pulls reactor (the Asio server runtime, with its TLS Server role),
+# transitively pulls reactor (the Asio server runtime, with its TLS Server role; pinned above),
 # http-parser, radix-router, and compressors (the response-compression codecs), so
 # the whole request path comes in with one dependency.
-FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG 58d4188f78b769286005fc744485a54a22a4e243)
+FetchContent_Declare(http_lib GIT_REPOSITORY https://github.com/Kronuz/http.git GIT_TAG aed0314dbbf0b236ee5dfd6756e30d88aff90b4f)
 FetchContent_MakeAvailable(http_lib)
 
 # The deferred, lock-free logger (leveled, colored, timestamped). It transitively
@@ -55,10 +59,14 @@ target_link_libraries(prism PRIVATE http::http task::asio traceback::traceback l
 if(TARGET reactor::tls)
   target_link_libraries(prism PRIVATE reactor::tls)
   target_compile_definitions(prism PRIVATE PRISM_TLS=1)
+  set(PRISM_TLS_BUILT ON)
 endif()
 
 # The lifecycle test runs the built prism: readiness, the pid lock, and a SIGTERM under load.
 enable_testing()
 add_executable(prism_lifecycle_test src/test/lifecycle_test.cc)
 target_link_libraries(prism_lifecycle_test PRIVATE task::task Threads::Threads)
+if(PRISM_TLS_BUILT)
+  target_compile_definitions(prism_lifecycle_test PRIVATE PRISM_TLS=1)
+endif()
 add_test(NAME prism_lifecycle COMMAND prism_lifecycle_test $<TARGET_FILE:prism>)

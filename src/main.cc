@@ -55,7 +55,7 @@
 #include "process.hh"       // task: run_daemon, ProcessLock
 #include "task_asio.hh"     // task: asio_scheduler, the control loop
 #ifdef PRISM_TLS
-#include "http_asio_tls.h"  // http: the TLS connection factory
+#include "http_asio_tls.h"  // http: the TLS service constructor
 #include "reactor_tls.h"    // reactor: TLS contexts (the Server role)
 #endif
 #include "colors.h"         // term-color: rgb()/brgb()/CLEAR_COLOR (stacked escapes)
@@ -265,6 +265,7 @@ struct Options {
 	std::string bind_address;  // empty: every interface
 	std::size_t reactors = std::max(1u, std::thread::hardware_concurrency());
 	std::size_t max_clients = 1024;
+	bool max_clients_set = false;  // an explicit value must fit the descriptor limit; the default shrinks
 	std::size_t max_in_flight = 1024;  // per reactor; 0 = no cap
 	std::chrono::milliseconds idle_timeout{75'000};
 	std::chrono::milliseconds shutdown_timeout{35'000};
@@ -277,6 +278,7 @@ struct Options {
 };
 
 constexpr std::chrono::milliseconds kShutdownGrace{5'000};  // fixed (Settled 3)
+constexpr std::size_t kDescriptorReserve = 64;  // open besides connections: log, pid lock, listeners, TLS files
 constexpr auto kMaxDuration = std::chrono::milliseconds(std::chrono::hours(24));
 
 const char* kUsage =
@@ -290,9 +292,10 @@ const char* kUsage =
 	"flags override it, and its relative paths are relative to the file. The TLS key is\n"
 	"the private file. --daemonize detaches once serving, logging to RUNTIME_DIR/prism-PORT.log;\n"
 	"RUNTIME_DIR/prism-PORT.pid is locked while prism runs. SIGINT or SIGTERM stops:\n"
-	"a response being written gets the grace (5 s, at most the shutdown bound), then its\n"
-	"connection closes; a request still being received is reset with no response. A second\n"
-	"signal changes nothing yet; a third flushes and dies.\n";
+	"prism stops accepting connections and lets the requests in flight finish, until the\n"
+	"shutdown bound less the 5 s grace; then it cancels them, a response being written gets\n"
+	"the grace (at most the bound) and its connection closes. A second signal cancels at\n"
+	"once; a third flushes and dies.\n";
 
 std::uint64_t unsigned_value(const std::string& key, const std::string& value, std::uint64_t minimum, std::uint64_t maximum) {
 	std::uint64_t n = 0;
@@ -321,7 +324,7 @@ void set_option(Options& o, const std::string& key, const std::string& value, co
 	if (key == "port") { o.port = static_cast<unsigned short>(unsigned_value(key, value, 0, 65535)); }
 	else if (key == "bind_address") { o.bind_address = value; }
 	else if (key == "reactors") { o.reactors = unsigned_value(key, value, 1, 1024); }
-	else if (key == "max_clients") { o.max_clients = unsigned_value(key, value, 1, 1u << 24); }
+	else if (key == "max_clients") { o.max_clients = unsigned_value(key, value, 1, 1u << 24); o.max_clients_set = true; }
 	else if (key == "max_in_flight") { o.max_in_flight = unsigned_value(key, value, 0, 1u << 24); }
 	else if (key == "idle_timeout_ms") { o.idle_timeout = ms(0); }
 	else if (key == "shutdown_timeout_ms") { o.shutdown_timeout = ms(1); }
@@ -426,18 +429,31 @@ void configure_logging(const Options& o) {
 	Logging::add_handler(std::make_unique<StderrLogger>());
 }
 
-// The HTTP component: start() binds and serves; drain() runs http's stop, which cancels the
-// requests in flight (their responses are still written), gives them the grace, then forces.
+// The HTTP component: start() binds and serves; stop() closes the listeners, and drain() waits for
+// the requests in flight until its cancel token, then cancels them and runs http's stop (the
+// grace, then the connections still open are forced).
 struct Http {
 	http::HttpAsioService& service;
+	asio::io_context& io;
 	unsigned short port;
+	std::thread waiter;
 
+	~Http() { if (waiter.joinable()) { waiter.join(); } }
 	task::task<void> start(task::cancel_token) {
 		service.start(port);
 		co_return;
 	}
-	void stop() {}  // closing only the listeners waits for http's stop_accepting()
-	task::task<std::vector<std::string>> drain(const task::stop_bound&) {
+	void stop() { service.stop_accepting(); }
+	task::task<std::vector<std::string>> drain(const task::stop_bound& bound) {
+		// wait_requests blocks, so it runs on its own thread and the loop keeps its wheel.
+		co_await task::await_asio<void(asio::error_code)>([&](auto handler) {
+			waiter = std::thread([this, token = bound.cancel, handler = std::move(handler)]() mutable {
+				service.wait_requests(token);
+				asio::post(io, [done = std::move(handler)]() mutable { std::move(done)(asio::error_code{}); });
+			});
+		});
+		waiter.join();
+		service.cancel_requests();
 		service.stop();
 		co_return std::vector<std::string>{};
 	}
@@ -445,8 +461,45 @@ struct Http {
 	std::string name() const { return "http"; }
 };
 
+// The descriptor step: one per connection plus the reserve. Raises the soft limit toward the hard
+// one; short of the budget, an explicit max_clients is refused and the default shrinks to fit.
+void check_descriptors(Options& o) {
+	const std::size_t wanted = o.max_clients + kDescriptorReserve;
+	const std::size_t have = reactor::raise_open_files(wanted);
+	if (have >= wanted) { return; }
+	if (o.max_clients_set) {
+		throw config_error("max_clients " + std::to_string(o.max_clients) + " needs " + std::to_string(wanted) +
+			" descriptors (with a reserve of " + std::to_string(kDescriptorReserve) + "); the limit is " + std::to_string(have));
+	}
+	if (have <= kDescriptorReserve) {
+		throw config_error("the descriptor limit " + std::to_string(have) + " leaves no room for connections");
+	}
+	o.max_clients = have - kDescriptorReserve;
+	L_WARNING("prism: descriptor limit {}: max_clients is {}", have, o.max_clients);
+}
+
+// The TLS the service presents: reactor's server context (key mode, validity and strict checked),
+// none for plain HTTP.
+http::Tls make_tls(const Options& o) {
+	http::Tls tls;
+	if (o.tls_cert.empty()) { return tls; }
+#ifdef PRISM_TLS
+	try {
+		tls.context = reactor::tls::server_context(reactor::tls::Options{o.tls_cert.string(), o.tls_key.string(), ""});
+	} catch (const std::exception& e) {
+		throw config_error(std::string("TLS: ") + e.what());
+	}
+	if (reactor::tls::seconds_to_expiry(*tls.context) < reactor::tls::expiry_warning.count()) {
+		L_WARNING("prism: the TLS certificate {} expires within 14 days", o.tls_cert.string());
+	}
+	return tls;
+#else
+	throw config_error("this prism was built without TLS (OpenSSL 3 was not found)");
+#endif
+}
+
 // Everything after the fork: the pid lock, the signals, the log, then the lifecycle.
-int serve(const Options& o, const task::daemon_ready& daemon_ready) {
+int serve(Options o, const task::daemon_ready& daemon_ready) {
 	task::ProcessLock lock(o.runtime_dir / ("prism-" + std::to_string(o.port) + ".pid"), false);
 	if (!lock.acquired()) {
 		std::printf("prism: already running on port %u\n", unsigned(o.port));
@@ -458,20 +511,8 @@ int serve(const Options& o, const task::daemon_ready& daemon_ready) {
 	configure_logging(o);
 	struct LogSession { ~LogSession() { Logging::finish(); } } log_session;  // drains the LOG thread last
 
-	http::HttpAsioService::ConnectionFactory connection;
-	if (!o.tls_cert.empty()) {
-#ifdef PRISM_TLS
-		auto context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
-		try {
-			reactor::tls::configure(*context, reactor::tls::Options{o.tls_cert.string(), o.tls_key.string(), ""}, reactor::tls::Role::Server);
-		} catch (const std::exception& e) {
-			throw config_error(std::string("TLS: ") + e.what());
-		}
-		connection = http::tls_connection_factory(std::move(context), std::chrono::seconds(5), 64, o.max_clients);
-#else
-		throw config_error("this prism was built without TLS (OpenSSL 3 was not found)");
-#endif
-	}
+	check_descriptors(o);
+	[[maybe_unused]] auto tls = make_tls(o);
 
 	DemoApp app;
 	// The request/response logging middleware, with prism's JSON reindenter as the body
@@ -491,10 +532,18 @@ int serve(const Options& o, const task::daemon_ready& daemon_ready) {
 	};
 	http_log::AccessLog access(app, std::move(logopts));
 
-	// One bound for plain and TLS: max_clients connections, max_in_flight requests per reactor.
-	http::HttpAsioService service(access, o.reactors, o.max_in_flight, std::move(connection), o.max_clients);
-	service.set_idle_timeout(o.idle_timeout);
-	service.set_shutdown_grace(std::min(kShutdownGrace, o.shutdown_timeout));
+	// Every bound in one http::Limits, plain and TLS alike; the rest are http's defaults.
+	const http::Limits limits{
+		.max_clients = o.max_clients,
+		.max_in_flight = o.max_in_flight,
+		.idle_timeout = o.idle_timeout,
+		.shutdown_grace = std::min(kShutdownGrace, o.shutdown_timeout),
+	};
+#ifdef PRISM_TLS
+	http::HttpAsioService service(access, o.reactors, limits, std::move(tls));
+#else
+	http::HttpAsioService service(access, o.reactors, limits);
+#endif
 	http::AsioBindOptions bind;
 	bind.address = o.bind_address;
 	service.set_bind_options(bind);
@@ -504,7 +553,7 @@ int serve(const Options& o, const task::daemon_ready& daemon_ready) {
 
 	asio::io_context io(1);
 	task::asio_scheduler loop(io.get_executor());
-	Http http{service, o.port};
+	Http http{service, io, o.port};
 	const bool https = !o.tls_cert.empty();
 	auto ready = [&] {
 		daemon_ready();

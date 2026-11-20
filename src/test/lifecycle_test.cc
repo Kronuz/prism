@@ -5,6 +5,12 @@
 //           arrives whole, no response is cut short, and prism exits 0 within the shutdown bound.
 //   stalled SIGTERM while a peer never reads its 4 MiB response: prism still exits 0 within a
 //           2 s shutdown bound, cutting that connection.
+//   drain   SIGTERM stops accepting at once while a request whose body is still arriving
+//           finishes and is answered whole; a second SIGTERM cancels the one still waiting.
+//   limits  a descriptor limit below max_clients: an explicit value exits EX_CONFIG, the default
+//           shrinks to fit and serves.
+//   tls     the server context's checks: a key readable by group exits EX_CONFIG, an owner-only
+//           key serves HTTPS.
 
 #include <algorithm>
 #include <atomic>
@@ -26,9 +32,12 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sysexits.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -63,10 +72,20 @@ unsigned short free_port() {
 	return ntohs(a.sin_port);
 }
 
-pid_t spawn(std::vector<std::string> args) {
+pid_t spawn(std::vector<std::string> args, std::size_t open_files = 0, const std::string& stderr_to = {}) {
 	args.insert(args.begin(), prism);
 	pid_t pid = ::fork();
 	if (pid == 0) {
+		if (open_files) {
+			rlimit limit{};
+			::getrlimit(RLIMIT_NOFILE, &limit);
+			limit.rlim_cur = limit.rlim_max = open_files;
+			if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) { ::_exit(126); }
+		}
+		if (!stderr_to.empty()) {
+			const int fd = ::open(stderr_to.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+			if (fd >= 0) { ::dup2(fd, 2); }
+		}
 		std::vector<char*> argv;
 		for (auto& a : args) { argv.push_back(a.data()); }
 		argv.push_back(nullptr);
@@ -234,7 +253,7 @@ void load_test() {
 				while (!done.load() && send_all(fd, req)) {
 					auto r = reader.read();
 					if (r.whole && r.status == 200) { ++whole; continue; }
-					if (r.started) { ++cut; }
+					if (r.started && !(r.whole && r.status == 503)) { ++cut; }  // a refusal after the stop is whole
 					break;
 				}
 				::close(fd);
@@ -319,6 +338,130 @@ void stalled_test() {
 		static_cast<long long>(std::chrono::milliseconds(bound).count()));
 }
 
+// A request whose body is still arriving at the stop is not reset: the drain stops accepting and
+// waits for it. A second signal then cancels the request still waiting.
+void drain_test() {
+	const auto dir = scratch / "drain";
+	const unsigned short port = free_port();
+	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "2",
+		"--shutdown-timeout-ms", "20000", "-q"});
+	int probe = -1;
+	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
+	if (probe < 0) { ::kill(child, SIGKILL); exit_status(child); return; }
+	::close(probe);
+
+	const std::string body(1000, 'b');
+	const std::string head = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+	int slow = connect_to(port);
+	CHECK(slow >= 0 && send_all(slow, head + body.substr(0, 400)));
+	std::this_thread::sleep_for(200ms);  // admitted: its first byte is in
+	CHECK(::kill(child, SIGTERM) == 0);
+	std::this_thread::sleep_for(500ms);
+
+	// Stopped accepting: a new connection is refused or closed unanswered.
+	int late = connect_to(port);
+	if (late >= 0) {
+		Reader reader{late};
+		send_all(late, request("GET", "/hello"));
+		CHECK(!reader.read().whole || reader.buffered.empty());
+		::close(late);
+	}
+	// Still running: the request in flight was not cancelled.
+	CHECK(::waitpid(child, nullptr, WNOHANG) == 0);
+
+	CHECK(slow >= 0 && send_all(slow, body.substr(400)));
+	Reader reader{slow};
+	auto r = slow >= 0 ? reader.read() : Response{};
+	CHECK(r.whole && r.status == 200 && r.body.size() >= body.size());
+	if (slow >= 0) { ::close(slow); }
+	const auto status = exit_within(child, 10s);
+	CHECK(status == 0);
+
+	// A second SIGTERM hurries: the request still being received is cancelled at once.
+	const unsigned short port2 = free_port();
+	const auto child2 = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port2), "--reactors", "2",
+		"--shutdown-timeout-ms", "20000", "-q"});
+	CHECK(eventually(10s, [&] { return (probe = connect_to(port2)) >= 0; }));
+	if (probe < 0) { ::kill(child2, SIGKILL); exit_status(child2); return; }
+	::close(probe);
+	int stuck = connect_to(port2);
+	CHECK(stuck >= 0 && send_all(stuck, head + body.substr(0, 400)));
+	std::this_thread::sleep_for(200ms);
+	CHECK(::kill(child2, SIGTERM) == 0);
+	std::this_thread::sleep_for(500ms);
+	CHECK(::waitpid(child2, nullptr, WNOHANG) == 0);
+	const auto hurried = clock_type::now();
+	CHECK(::kill(child2, SIGTERM) == 0);
+	const auto status2 = exit_within(child2, 15s);
+	const auto took = clock_type::now() - hurried;
+	if (stuck >= 0) { ::close(stuck); }
+	CHECK(status2 == 0);
+	CHECK(took < 8s);
+	std::fprintf(stderr, "drain: finished request %d, hurried exit %d %lld ms after the second SIGTERM\n", r.status,
+		status2.value_or(-1), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
+}
+
+// A descriptor limit of 200 holds 136 connections with the reserve of 64.
+void limits_test() {
+	const auto dir = scratch / "limits";
+	std::filesystem::create_directories(dir);
+	const unsigned short refused_port = free_port();
+	const auto refused_log = (dir / "refused.err").string();
+	const auto refused = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(refused_port), "--max-clients", "1024"}, 200, refused_log);
+	CHECK(exit_status(refused) == EX_CONFIG);
+	CHECK(slurp(refused_log).find("max_clients 1024 needs 1088 descriptors") != std::string::npos);
+
+	const unsigned short port = free_port();
+	const auto fitted_log = (dir / "fitted.err").string();
+	const auto fitted = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "1", "--no-color"}, 200, fitted_log);
+	int probe = -1;
+	CHECK(eventually(10s, [&] { return (probe = connect_to(port)) >= 0; }));
+	if (probe >= 0) {
+		CHECK(send_all(probe, request("GET", "/hello")));
+		Reader reader{probe};
+		auto r = reader.read();
+		CHECK(r.whole && r.status == 200);
+		::close(probe);
+	}
+	::kill(fitted, SIGTERM);
+	CHECK(exit_within(fitted, 10s) == 0);
+	CHECK(slurp(fitted_log).find("max_clients is 136") != std::string::npos);
+}
+
+#ifdef PRISM_TLS
+// The server context's checks, through the built binary: a key readable by group is refused, an
+// owner-only one serves HTTPS. Skipped without the openssl and curl tools.
+void tls_test() {
+	if (std::system("openssl version >/dev/null 2>&1") != 0 || std::system("curl --version >/dev/null 2>&1") != 0) {
+		std::fprintf(stderr, "tls: skipped (no openssl or curl)\n");
+		return;
+	}
+	const auto dir = scratch / "tls";
+	std::filesystem::create_directories(dir);
+	const auto cert = dir / "cert.pem", key = dir / "key.pem";
+	const std::string make = "openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost -keyout " + key.string() +
+		" -out " + cert.string() + " >/dev/null 2>&1";
+	if (std::system(make.c_str()) != 0) { std::fprintf(stderr, "tls: skipped (openssl could not make a certificate)\n"); return; }
+
+	::chmod(key.c_str(), 0644);
+	const auto err = (dir / "group.err").string();
+	const auto refused = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(free_port()), "--tls-cert", cert.string(),
+		"--tls-key", key.string()}, 0, err);
+	CHECK(exit_status(refused) == EX_CONFIG);
+	CHECK(slurp(err).find("readable by group or others") != std::string::npos);
+
+	::chmod(key.c_str(), 0600);
+	const unsigned short port = free_port();
+	const auto child = spawn({"--runtime-dir", dir.string(), "--port", std::to_string(port), "--reactors", "1", "--tls-cert", cert.string(),
+		"--tls-key", key.string(), "-q"});
+	const std::string get = "curl -sk --max-time 5 https://127.0.0.1:" + std::to_string(port) + "/hello > " + (dir / "hello.out").string();
+	CHECK(eventually(10s, [&] { return std::system(get.c_str()) == 0; }));
+	CHECK(slurp(dir / "hello.out") == "hello from prism\n");
+	::kill(child, SIGTERM);
+	CHECK(exit_within(child, 10s) == 0);
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -337,6 +480,11 @@ int main(int argc, char** argv) {
 	daemon_test();
 	load_test();
 	stalled_test();
+	drain_test();
+	limits_test();
+#ifdef PRISM_TLS
+	tls_test();
+#endif
 	std::error_code ec;
 	if (!failures) { std::filesystem::remove_all(scratch, ec); }
 	std::fprintf(stderr, failures ? "FAILED: %d checks\n" : "passed\n", failures);

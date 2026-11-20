@@ -66,7 +66,8 @@ prism [--config FILE] [--port N] [--bind-address ADDR] [--reactors N]
   --port N          port to listen on (default 8880; 0 binds a free port)
   --bind-address A  address to listen on (default every interface)
   --reactors N      event loops (default one per hardware thread)
-  --max-clients N   open connections, plain and TLS (default 1024)
+  --max-clients N   open connections, plain and TLS (default 1024; needs N + 64 descriptors,
+                    an explicit N that does not fit exits 78, the default shrinks)
   --max-in-flight N requests admitted per loop (default 1024; 0 is no cap)
   --idle-timeout-ms MS          close an idle connection (default 75000; 0 is off)
   --shutdown-timeout-ms MS      bound on a stop (default 35000)
@@ -80,11 +81,10 @@ prism [--config FILE] [--port N] [--bind-address ADDR] [--reactors N]
   --no-color        same as --color never; NO_COLOR is honored too
   --no-tracebacks   no stack trace on an unhandled error
 
-SIGINT or SIGTERM stops: a response being written gets the grace (5 s, at most the
-shutdown bound), then its connection closes; a request still being received is reset
-with no response. A second signal changes nothing yet, and a third flushes and dies.
-Finishing those requests and hurrying on the second signal come with http's
-stop_accepting() (Detent quest prism-server-composition-limits).
+SIGINT or SIGTERM stops accepting connections and lets the requests in flight finish,
+until the shutdown bound less the 5 s grace; then it cancels them, a response being
+written gets the grace (at most the bound) and its connection closes. A second signal
+cancels at once, and a third flushes and dies.
 ```
 
 ## 📦 Installation
